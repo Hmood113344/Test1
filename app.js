@@ -199,6 +199,7 @@ function pttPaint(){
  var b=$('ptt');b.classList.toggle('live',pttOn);b.textContent=pttOn?'🟢 تتكلم الحين... (فك لإيقاف المايك)':'🎙️ اضغط واستمر للتحدث';
  if(pipWin){var pb=pipWin.document.getElementById('pb');if(pb){pb.style.background=pttOn?'#16a34a':'#1d4ed8';pb.innerHTML=pttOn?'🟢<br>تتكلم...':'🎙️<br>اضغط واستمر'}}
  pipDraw();
+ if(pipV){try{if(pttOn&&pipV.paused)pipV.play().catch(function(){});if(!pttOn&&!pipV.paused)pipV.pause()}catch(e){}}
 }
 /* ---------- النافذة العائمة فوق يمين ---------- */
 var pipBusy=false,pipTimer=null,pipPV=null;
@@ -228,6 +229,8 @@ function pipPrep(){
  try{navigator.mediaSession.setActionHandler('play',function(){ptt(true)});navigator.mediaSession.setActionHandler('pause',function(){ptt(false)})}catch(e){}
  v.addEventListener('leavepictureinpicture',function(){pipClean();ptt(false)});
  v.addEventListener('webkitpresentationmodechanged',function(){if(pipV===v&&v.webkitPresentationMode!=='picture-in-picture'){pipClean();ptt(false)}});
+ v.addEventListener('play',function(){if(pipV===v&&!pttOn){ptt(true);if(!pttOn)v.pause()}});
+ v.addEventListener('pause',function(){if(pipV===v&&pttOn)ptt(false)});
  pipPV=v;v.play().catch(function(){});
  return v;
 }
@@ -274,7 +277,7 @@ async function pipFallback(auto){ /* سفاري وغيره: فيديو عائم 
    done=(v.webkitPresentationMode==='picture-in-picture');
   }
   if(!done)throw err||new Error('NotEntered');
-  pipV=v;
+  pipV=v;v.pause(); /* المايك مقفل: الفيديو واقف، فتظهر لك أيقونة التشغيل = تكلم */
  }catch(e){var er=new Error(e&&e.message);er.name=((e&&e.name)||'Error')+'@'+step;throw er}
 }
 function pipSetup(){
