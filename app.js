@@ -146,9 +146,10 @@ function who(u){return S.people.filter(function(p){return p.uid===u})[0]}
 async function join(){
  var name=$('nm').value.trim();if(!name)return toast('اكتب اسمك');
  if(!window.RTCPeerConnection||!navigator.mediaDevices)return toast('المتصفح ما يدعم الصوت (لازم HTTPS)');
- try{stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false})}catch(e){return toast('اسمح للموقع باستخدام المايك')}
+ extStart();
+ try{stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false})}catch(e){extStop();return toast('اسمح للموقع باستخدام المايك')}
  mic=stream.getAudioTracks()[0];mic.enabled=false;
- try{ME=await api('/api/join',{name:name})}catch(e){return toast(e.message)}
+ try{ME=await api('/api/join',{name:name})}catch(e){extStop();return toast(e.message)}
  S=ME.state;ICE=ME.ice;
  ac=new(window.AudioContext||window.webkitAudioContext)();ac.resume();rdest=ac.createMediaStreamDestination();
  ac.createMediaStreamSource(stream).connect(rdest);
@@ -156,7 +157,7 @@ async function join(){
  watch(ME.uid,stream);ME.chat.forEach(addChat);
  ev=new EventSource('/api/events?uid='+ME.uid);ev.onmessage=function(e){onMsg(JSON.parse(e.data))};
  ME.existing.forEach(function(u){peer(u,true)});
- bind($('ptt'));paint();pipSetup();setInterval(level,150);
+ bind($('ptt'));paint();pipSetup();extSetup();setInterval(level,150);
 }
 function onMsg(m){
  if(m.t==='state'){S=m.s;Object.keys(P).forEach(function(u){if(!who(u)){P[u].pc.close();P[u].el.remove();delete P[u]}});paint();recCheck()}
@@ -197,8 +198,8 @@ document.addEventListener('keydown',function(e){if(e.code==='Space'&&ME&&!e.repe
 document.addEventListener('keyup',function(e){if(e.code==='Space'&&ME)ptt(false)});
 function pttPaint(){
  var b=$('ptt');b.classList.toggle('live',pttOn);b.textContent=pttOn?'🟢 تتكلم الحين... (فك لإيقاف المايك)':'🎙️ اضغط واستمر للتحدث';
- if(pipWin){var pb=pipWin.document.getElementById('pb');if(pb){pb.style.background=pttOn?'#16a34a':'#1d4ed8';pb.innerHTML=pttOn?'🟢<br>تتكلم...':'🎙️<br>اضغط واستمر'}}
- pipDraw();
+ if(pipWin){var pb=pipWin.document.getElementById('pb');if(pb){pb.style.background=pttOn?'#16a34a':'#1d4ed8';pb.innerHTML=pttOn?'🟢<br>المايك شغال<br><span style="font-size:15px">اضغط للقفل</span>':'🔇<br>المايك مقفل<br><span style="font-size:15px">اضغط للتشغيل</span>'}}
+ pipDraw();extPaint();
  if(pipV){try{if(pttOn&&pipV.paused)pipV.play().catch(function(){});if(!pttOn&&!pipV.paused)pipV.pause()}catch(e){}}
 }
 /* ---------- النافذة العائمة فوق يمين ---------- */
@@ -246,8 +247,8 @@ async function openPip(auto){
     pipWin=w;
     try{pipWin.moveTo(screen.availLeft+screen.availWidth-320,screen.availTop+10)}catch(e){}
     var d=pipWin.document;d.body.style.cssText='margin:0;background:#0a1628;display:flex;align-items:center;justify-content:center;overflow:hidden;direction:rtl;font-family:Tahoma,sans-serif';
-    d.body.innerHTML='<button id="pb" style="width:240px;height:240px;border-radius:50%;border:5px solid #60a5fa;background:#1d4ed8;color:#fff;font-size:24px;font-weight:800;touch-action:none;user-select:none;cursor:pointer">🎙️<br>اضغط واستمر</button>';
-    bind(d.getElementById('pb'));
+    d.body.innerHTML='<button id="pb" style="width:240px;height:240px;border-radius:50%;border:5px solid #60a5fa;background:#1d4ed8;color:#fff;font-size:24px;font-weight:800;touch-action:none;user-select:none;cursor:pointer">🔇<br>المايك مقفل<br><span style="font-size:15px">اضغط للتشغيل</span></button>';
+    d.getElementById('pb').addEventListener('click',extToggle);
     pipWin.addEventListener('pagehide',function(){pipWin=null;ptt(false)});
     pipBusy=false;return;
    }
@@ -286,6 +287,38 @@ function pipSetup(){
   navigator.mediaSession.setActionHandler('enterpictureinpicture',function(){openPip(true)})}catch(e){}
  /* فتح تلقائي صامت عند الطلعة من الصفحة (المتصفح يمنعه بدون لمسة، فلو فشل ما يطلع أي رسالة) */
  document.addEventListener('visibilitychange',function(){if(document.hidden&&ME&&navigator.userActivation&&navigator.userActivation.isActive)openPip(true)});
+}
+/* ---------- التحكم بالمايك من برا الموقع (إشعارات / سماعة / مفتاح Play-Pause) ---------- */
+var extEl=null,extLast=0,extKey='';
+function extWav(){
+ var sr=8000,n=sr*10,b=new Uint8Array(44+n),d=new DataView(b.buffer);
+ function w(o,t){for(var i=0;i<t.length;i++)b[o+i]=t.charCodeAt(i)}
+ w(0,'RIFF');d.setUint32(4,36+n,true);w(8,'WAVE');w(12,'fmt ');d.setUint32(16,16,true);d.setUint16(20,1,true);d.setUint16(22,1,true);
+ d.setUint32(24,sr,true);d.setUint32(28,sr,true);d.setUint16(32,1,true);d.setUint16(34,8,true);w(36,'data');d.setUint32(40,n,true);b.fill(128,44);
+ return URL.createObjectURL(new Blob([b],{type:'audio/wav'}));
+}
+function extToggle(){var n=Date.now();if(n-extLast<400)return;extLast=n;ptt(!pttOn);extPaint(true)}
+function extStart(){
+ if(!extEl){
+  extEl=document.createElement('audio');extEl.src=extWav();extEl.loop=true;extEl.setAttribute('playsinline','');extEl.style.display='none';document.body.appendChild(extEl);
+  extEl.addEventListener('pause',function(){setTimeout(function(){if(extEl&&extEl.paused)extEl.play().catch(function(){})},300)});
+ }
+ extEl.play().catch(function(){});
+}
+function extStop(){
+ try{var ms=navigator.mediaSession;['play','pause','togglemicrophone'].forEach(function(a){try{ms.setActionHandler(a,null)}catch(x){}});ms.metadata=null;ms.playbackState='none'}catch(x){}
+ if(extEl){var el=extEl;extEl=null;try{el.pause();el.removeAttribute('src');el.load();el.remove()}catch(x){}}
+}
+function extSetup(){
+ var ms=navigator.mediaSession;if(!ms)return;
+ ['play','pause','togglemicrophone'].forEach(function(a){try{ms.setActionHandler(a,extToggle)}catch(x){}});
+ extPaint(true);
+}
+function extPaint(force){
+ var k=pttOn?'1':'0';if(!force&&k===extKey)return;extKey=k;
+ try{var ms=navigator.mediaSession;ms.playbackState=pttOn?'playing':'paused';
+  ms.metadata=new MediaMetadata({title:pttOn?'🟢 المايك شغال':'🔇 المايك مقفل',artist:'تردد القطاعات — اضغط تشغيل/إيقاف'});
+  if(ms.setMicrophoneActive)ms.setMicrophoneActive(pttOn)}catch(x){}
 }
 /* ---------- الواجهة ---------- */
 function paint(){
@@ -329,7 +362,7 @@ function leave(k){
  recStop();if(ev)ev.close();Object.keys(P).forEach(function(u){P[u].pc.close()});
  if(!k&&ME)navigator.sendBeacon('/api/leave',new Blob([JSON.stringify({uid:ME.uid})],{type:'application/json'}));
  try{stream.getTracks().forEach(function(t){t.stop()})}catch(e){}
- if(pipWin)try{pipWin.close()}catch(e){}try{if(document.pictureInPictureElement)document.exitPictureInPicture()}catch(e){}pipClean();pipKill();
+ if(pipWin)try{pipWin.close()}catch(e){}try{if(document.pictureInPictureElement)document.exitPictureInPicture()}catch(e){}pipClean();pipKill();extStop();
  setTimeout(function(){location.reload()},300);
 }
 window.addEventListener('pagehide',function(){if(ME&&!ME.left&&false)leave()});
