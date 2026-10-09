@@ -204,7 +204,7 @@ function pttPaint(){
 var pipBusy=false,pipTimer=null;
 function pipClean(){
  if(pipTimer){clearInterval(pipTimer);pipTimer=null}
- if(pipV){try{pipV.pause();pipV.srcObject=null;pipV.remove()}catch(e){}}
+ if(pipV){try{if(pipV.webkitPresentationMode==='picture-in-picture')pipV.webkitSetPresentationMode('inline')}catch(e){}try{pipV.pause();pipV.srcObject=null;pipV.remove()}catch(e){}}
  pipV=null;pipC=null;pipBusy=false;
 }
 function pipFail(auto,e){
@@ -239,18 +239,23 @@ function pipDraw(){
  x.fillStyle='#fff';x.font='bold 30px Tahoma';x.textAlign='center';x.fillText(pttOn?'🟢 المايك شغال':'🎙️ المايك مقفل',160,160);x.font='18px Tahoma';x.fillText('زر التشغيل = تكلم / إيقاف = اقفل',160,210);
 }
 async function pipFallback(auto){ /* سفاري وغيره: فيديو عائم + أزرار التشغيل/الإيقاف (ضغطة تشغّل وضغطة تقفل، ما فيه ضغط مستمر) */
- if(!document.pictureInPictureEnabled){if(!auto)toast('هذا المتصفح ما يدعم النافذة العائمة — استخدم Chrome أو Edge');return}
+ var v=document.createElement('video');
+ var stdPip=!!(document.pictureInPictureEnabled&&v.requestPictureInPicture),wkPip=(typeof v.webkitSetPresentationMode==='function');
+ if(!stdPip&&!wkPip){if(!auto)toast('هذا المتصفح ما يدعم النافذة العائمة — استخدم Chrome أو Edge');return}
  var c=document.createElement('canvas');c.width=c.height=320;pipC=c;pipDraw();
- var v=document.createElement('video');v.muted=true;v.playsInline=true;v.setAttribute('playsinline','');
- v.style.cssText='position:fixed;left:0;top:0;width:2px;height:2px;opacity:0.01;pointer-events:none';
+ v.muted=true;v.playsInline=true;v.setAttribute('playsinline','');v.setAttribute('webkit-playsinline','');
+ v.style.cssText='position:fixed;right:0;bottom:0;width:160px;height:160px;opacity:0.01;pointer-events:none;z-index:-1';
  v.srcObject=c.captureStream(10);document.body.appendChild(v);
  pipTimer=setInterval(pipDraw,500); /* يبقي الفريمات تنزل للفيديو عشان ما يعلق */
  try{navigator.mediaSession.setActionHandler('play',function(){ptt(true)});navigator.mediaSession.setActionHandler('pause',function(){ptt(false)})}catch(e){}
  await Promise.race([v.play(),new Promise(function(r,j){setTimeout(function(){j(new Error('timeout'))},3000)})]);
  if(v.readyState<1)await new Promise(function(r){v.addEventListener('loadedmetadata',r,{once:true});setTimeout(r,1500)});
- await v.requestPictureInPicture();
+ if(stdPip){await v.requestPictureInPicture();v.addEventListener('leavepictureinpicture',function(){pipClean();ptt(false)})}
+ else{ /* سفاري آيفون */
+  v.webkitSetPresentationMode('picture-in-picture');
+  v.addEventListener('webkitpresentationmodechanged',function(){if(v.webkitPresentationMode!=='picture-in-picture'){pipClean();ptt(false)}});
+ }
  pipV=v;
- v.addEventListener('leavepictureinpicture',function(){pipClean();ptt(false)});
 }
 function pipSetup(){
  try{navigator.mediaSession.metadata=new MediaMetadata({title:'تردد القطاعات — الروم الصوتي'});navigator.mediaSession.playbackState='playing';
