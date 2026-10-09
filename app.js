@@ -201,15 +201,35 @@ function pttPaint(){
  pipDraw();
 }
 /* ---------- النافذة العائمة فوق يمين ---------- */
-var pipBusy=false,pipTimer=null;
+var pipBusy=false,pipTimer=null,pipPV=null;
 function pipClean(){
+ try{if(pipV&&pipV.webkitPresentationMode==='picture-in-picture')pipV.webkitSetPresentationMode('inline')}catch(e){}
+ pipV=null;pipBusy=false;
+}
+function pipKill(){
  if(pipTimer){clearInterval(pipTimer);pipTimer=null}
- if(pipV){try{if(pipV.webkitPresentationMode==='picture-in-picture')pipV.webkitSetPresentationMode('inline')}catch(e){}try{pipV.pause();pipV.srcObject=null;pipV.remove()}catch(e){}}
- pipV=null;pipC=null;pipBusy=false;
+ if(pipPV){try{pipPV.pause();pipPV.srcObject=null;pipPV.remove()}catch(e){}}
+ pipPV=null;pipC=null;
 }
 function pipFail(auto,e){
  pipClean();
  if(!auto)toast('تعذر فتح النافذة العائمة'+(e&&e.name?' ('+e.name+')':''));
+}
+/* تجهيز الفيديو العائم مسبقاً (سفاري يبي الفتح فوراً بعد اللمسة، فنجهز كل شي قبل) */
+function pipPrep(){
+ if(pipPV)return pipPV;
+ var v=document.createElement('video');
+ if(!(document.pictureInPictureEnabled&&v.requestPictureInPicture)&&typeof v.webkitSetPresentationMode!=='function')return null;
+ var c=document.createElement('canvas');c.width=c.height=320;pipC=c;pipDraw();
+ v.muted=true;v.playsInline=true;v.setAttribute('playsinline','');v.setAttribute('webkit-playsinline','');
+ v.style.cssText='position:fixed;right:0;bottom:0;width:160px;height:160px;z-index:-1;pointer-events:none';
+ v.srcObject=c.captureStream(10);document.body.appendChild(v);
+ pipTimer=setInterval(pipDraw,100);
+ try{navigator.mediaSession.setActionHandler('play',function(){ptt(true)});navigator.mediaSession.setActionHandler('pause',function(){ptt(false)})}catch(e){}
+ v.addEventListener('leavepictureinpicture',function(){pipClean();ptt(false)});
+ v.addEventListener('webkitpresentationmodechanged',function(){if(pipV===v&&v.webkitPresentationMode!=='picture-in-picture'){pipClean();ptt(false)}});
+ pipPV=v;v.play().catch(function(){});
+ return v;
 }
 async function openPip(auto){
  auto=(auto===true);
@@ -239,25 +259,26 @@ function pipDraw(){
  x.fillStyle='#fff';x.font='bold 30px Tahoma';x.textAlign='center';x.fillText(pttOn?'🟢 المايك شغال':'🎙️ المايك مقفل',160,160);x.font='18px Tahoma';x.fillText('زر التشغيل = تكلم / إيقاف = اقفل',160,210);
 }
 async function pipFallback(auto){ /* سفاري وغيره: فيديو عائم + أزرار التشغيل/الإيقاف (ضغطة تشغّل وضغطة تقفل، ما فيه ضغط مستمر) */
- var v=document.createElement('video');
- var stdPip=!!(document.pictureInPictureEnabled&&v.requestPictureInPicture),wkPip=(typeof v.webkitSetPresentationMode==='function');
- if(!stdPip&&!wkPip){if(!auto)toast('هذا المتصفح ما يدعم النافذة العائمة — استخدم Chrome أو Edge');return}
- var c=document.createElement('canvas');c.width=c.height=320;pipC=c;pipDraw();
- v.muted=true;v.playsInline=true;v.setAttribute('playsinline','');v.setAttribute('webkit-playsinline','');
- v.style.cssText='position:fixed;right:0;bottom:0;width:160px;height:160px;opacity:0.01;pointer-events:none;z-index:-1';
- v.srcObject=c.captureStream(10);document.body.appendChild(v);
- pipTimer=setInterval(pipDraw,500); /* يبقي الفريمات تنزل للفيديو عشان ما يعلق */
- try{navigator.mediaSession.setActionHandler('play',function(){ptt(true)});navigator.mediaSession.setActionHandler('pause',function(){ptt(false)})}catch(e){}
- await Promise.race([v.play(),new Promise(function(r,j){setTimeout(function(){j(new Error('timeout'))},3000)})]);
- if(v.readyState<1)await new Promise(function(r){v.addEventListener('loadedmetadata',r,{once:true});setTimeout(r,1500)});
- if(stdPip){await v.requestPictureInPicture();v.addEventListener('leavepictureinpicture',function(){pipClean();ptt(false)})}
- else{ /* سفاري آيفون */
-  v.webkitSetPresentationMode('picture-in-picture');
-  v.addEventListener('webkitpresentationmodechanged',function(){if(v.webkitPresentationMode!=='picture-in-picture'){pipClean();ptt(false)}});
- }
- pipV=v;
+ var v=pipPrep();
+ if(!v){if(!auto)toast('هذا المتصفح ما يدعم النافذة العائمة — استخدم Chrome أو Edge');return}
+ var step='play';
+ try{
+  if(v.paused)v.play().catch(function(){});
+  if(!(v.videoWidth>0)){step='frames';for(var i=0;i<30&&!(v.videoWidth>0);i++)await new Promise(function(r){setTimeout(r,100)})}
+  step='pip';
+  var done=false,err=null;
+  if(document.pictureInPictureEnabled&&v.requestPictureInPicture){try{await v.requestPictureInPicture();done=true}catch(e){err=e}}
+  if(!done&&typeof v.webkitSetPresentationMode==='function'){
+   step='webkit';v.webkitSetPresentationMode('picture-in-picture');
+   await new Promise(function(r){setTimeout(r,600)});
+   done=(v.webkitPresentationMode==='picture-in-picture');
+  }
+  if(!done)throw err||new Error('NotEntered');
+  pipV=v;
+ }catch(e){var er=new Error(e&&e.message);er.name=((e&&e.name)||'Error')+'@'+step;throw er}
 }
 function pipSetup(){
+ if(!window.documentPictureInPicture)pipPrep();
  try{navigator.mediaSession.metadata=new MediaMetadata({title:'تردد القطاعات — الروم الصوتي'});navigator.mediaSession.playbackState='playing';
   navigator.mediaSession.setActionHandler('enterpictureinpicture',function(){openPip(true)})}catch(e){}
  /* فتح تلقائي صامت عند الطلعة من الصفحة (المتصفح يمنعه بدون لمسة، فلو فشل ما يطلع أي رسالة) */
@@ -305,7 +326,7 @@ function leave(k){
  recStop();if(ev)ev.close();Object.keys(P).forEach(function(u){P[u].pc.close()});
  if(!k&&ME)navigator.sendBeacon('/api/leave',new Blob([JSON.stringify({uid:ME.uid})],{type:'application/json'}));
  try{stream.getTracks().forEach(function(t){t.stop()})}catch(e){}
- if(pipWin)try{pipWin.close()}catch(e){}try{if(document.pictureInPictureElement)document.exitPictureInPicture()}catch(e){}pipClean();
+ if(pipWin)try{pipWin.close()}catch(e){}try{if(document.pictureInPictureElement)document.exitPictureInPicture()}catch(e){}pipClean();pipKill();
  setTimeout(function(){location.reload()},300);
 }
 window.addEventListener('pagehide',function(){if(ME&&!ME.left&&false)leave()});
