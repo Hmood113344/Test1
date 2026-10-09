@@ -126,10 +126,10 @@ body{background:linear-gradient(135deg,#0a1628 0%,#0d1f3c 40%,#0a2744 70%,#0d306
 <button class="btn" onclick="join()">🎙️ دخول الروم الصوتي</button></div></div>
 <div id="room">
 <div class="head"><b>📡 تردد القطاعات — الروم الصوتي</b><span id="cnt"></span>
-<span><button class="btn gray sm" onclick="showRecs()">📼 التسجيلات</button> <button class="btn gray sm" onclick="openPip()">🪟 نافذة المايك</button></span></div>
+<span><button class="btn gray sm" onclick="showRecs()">📼 التسجيلات</button></span></div>
 <div class="modes"><button class="mode" id="m-open" onclick="setMode('open')">🔊 الكل يتكلم ويسمع</button><button class="mode" id="m-mute" onclick="setMode('mute')">🔇 الروم صامت</button></div>
 <div class="note" id="note"></div><div class="grid" id="grid"></div>
-<div class="bar"><button class="ob" id="ptt">🎙️ اضغط واستمر للتحدث</button><button class="ob leave" onclick="leave()">🚪 خروج</button></div>
+<div class="bar"><button class="ob" id="ptt">🎙️ اضغط واستمر للتحدث</button><button class="ob" style="background:#334155" onclick="openPip()">🪟 نافذة عائمة</button><button class="ob leave" onclick="leave()">🚪 خروج</button></div>
 <button class="chatbtn" onclick="chatToggle()">💬 شات<span id="cd"></span></button>
 <div id="sheet"><div style="display:flex;justify-content:space-between;align-items:center"><b style="color:var(--gold-soft)">💬 الشات</b><button class="btn gray sm" onclick="chatToggle()">↩️ رجوع للروم</button></div>
 <div id="cl"></div><div class="ci"><input id="ci" maxlength="500" placeholder="اكتب رابط أو تعليمات أو سؤال..." onkeydown="if(event.key==='Enter')chatSend()"><button class="btn" onclick="chatSend()">إرسال</button></div></div>
