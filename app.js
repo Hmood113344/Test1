@@ -1,369 +1,578 @@
-// 📡 تردد القطاعات — موقع تجربة الروم الصوتي (نسخة من نظام المقابلة في app_29.js)
-// تشغيل:  npm i express  ثم  node app_30.js   (المتصفح لازم HTTPS أو localhost عشان المايك)
-const express = require("express"), crypto = require("crypto"), fs = require("fs"), path = require("path");
-const app = express();
-app.use(express.json({ limit: "1mb" }));
+// ============================================================
+//  فلاش | موقع تجربة الإشعارات (Web Push)
+//  التشغيل:  npm install   ثم   node app.js
+// ============================================================
+const express = require("express");
+const webpush = require("web-push");
+const fs = require("fs");
+const path = require("path");
+const zlib = require("zlib");
+
 const PORT = process.env.PORT || 7800;
-const REC_DIR = path.join(__dirname, "recordings"); fs.mkdirSync(REC_DIR, { recursive: true });
+const VAPID_FILE = path.join(__dirname, "vapid.json");
+const DEV_FILE = path.join(__dirname, "devices.json");
 
-const room = { mode: "open", chat: [], people: new Map(), rec: null };
-const conns = new Map(), pending = new Map();
-
-function send(uid, p) {
-    const r = conns.get(uid);
-    if (r) r.write("data: " + JSON.stringify(p) + "\n\n");
-    else { if (!pending.has(uid)) pending.set(uid, []); pending.get(uid).push(p); }
+/* ---------- مفاتيح VAPID ---------- */
+let vapid = { publicKey: process.env.VAPID_PUBLIC_KEY, privateKey: process.env.VAPID_PRIVATE_KEY };
+if (!vapid.publicKey || !vapid.privateKey) {
+    try { vapid = JSON.parse(fs.readFileSync(VAPID_FILE, "utf8")); }
+    catch (e) {
+        vapid = webpush.generateVAPIDKeys();
+        try { fs.writeFileSync(VAPID_FILE, JSON.stringify(vapid, null, 2)); } catch (_) {}
+        console.log("🔑 تم توليد مفاتيح VAPID جديدة. على Render حطها في Environment عشان ما تتغير بعد كل ريستارت:");
+        console.log("VAPID_PUBLIC_KEY=" + vapid.publicKey);
+        console.log("VAPID_PRIVATE_KEY=" + vapid.privateKey);
+    }
 }
-const state = () => ({ mode: room.mode, rec: !!room.rec, people: [...room.people.values()] });
-const push = () => { const s = state(); for (const u of room.people.keys()) send(u, { t: "state", s }); };
-const auth = (req, res) => {
-    const u = (req.body && req.body.uid) || req.query.uid;
-    if (!room.people.has(u)) { res.status(401).json({ error: "ادخل الروم أول" }); return null; }
-    return u;
+webpush.setVapidDetails(process.env.VAPID_SUBJECT || "mailto:admin@example.com", vapid.publicKey, vapid.privateKey);
+
+/* ---------- الأجهزة ---------- */
+const devices = new Map(); // id -> { id, name, standalone, sub, lastSeen, createdAt }
+try {
+    const saved = JSON.parse(fs.readFileSync(DEV_FILE, "utf8"));
+    for (const d of saved) devices.set(d.id, d);
+} catch (e) {}
+let saveTimer = null;
+function saveSoon() {
+    if (saveTimer) return;
+    saveTimer = setTimeout(() => {
+        saveTimer = null;
+        try { fs.writeFileSync(DEV_FILE, JSON.stringify([...devices.values()])); } catch (e) {}
+    }, 500);
+}
+
+const conns = new Map();      // id -> Set(res)  (الصفحة مفتوحة)
+const pendingOff = new Set(); // فترة سماح قصيرة عند عمل ريفريش
+const streams = new Set();    // كل اتصالات SSE
+
+const validId = v => typeof v === "string" && /^[a-zA-Z0-9-]{8,64}$/.test(v);
+const cleanName = v => String(v || "جهاز").replace(/[\r\n<>]/g, "").slice(0, 40);
+const isOnline = id => (conns.get(id) && conns.get(id).size > 0) || pendingOff.has(id);
+
+function publicList() {
+    return [...devices.values()].map(d => ({
+        id: d.id, name: d.name, standalone: !!d.standalone,
+        online: isOnline(d.id), push: !!d.sub, lastSeen: d.lastSeen,
+    })).sort((a, b) => (b.online - a.online) || (b.lastSeen - a.lastSeen));
+}
+function broadcast() {
+    const payload = "event: devices\ndata: " + JSON.stringify(publicList()) + "\n\n";
+    for (const s of streams) { try { s.write(payload); } catch (e) { streams.delete(s); } }
+}
+function upsert(id, name, standalone) {
+    let d = devices.get(id);
+    if (!d) { d = { id, createdAt: Date.now(), sub: null }; devices.set(id, d); }
+    d.name = cleanName(name); d.standalone = !!standalone; d.lastSeen = Date.now();
+    saveSoon();
+    return d;
+}
+
+/* ---------- أيقونات PNG (بدون ملفات خارجية) ---------- */
+const CRC = (() => { const t = []; for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(buf) { let c = 0xffffffff; for (let i = 0; i < buf.length; i++) c = CRC[(c ^ buf[i]) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
+function chunk(type, data) {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+    const td = Buffer.concat([Buffer.from(type), data]);
+    const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(td));
+    return Buffer.concat([len, td, crc]);
+}
+const BOLT = [[58, 8], [26, 55], [46, 55], [40, 92], [74, 42], [54, 42], [64, 8]].map(p => [p[0] / 100, p[1] / 100]);
+function inPoly(x, y, poly) {
+    let ins = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const [xi, yi] = poly[i], [xj, yj] = poly[j];
+        if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) ins = !ins;
+    }
+    return ins;
+}
+function makeIcon(size) {
+    const S = 2, stride = size * 3 + 1, raw = Buffer.alloc(stride * size);
+    const poly = BOLT.map(p => [0.5 + (p[0] - 0.5) * 0.74, 0.5 + (p[1] - 0.5) * 0.74]);
+    const mix = (a, b, t) => a + (b - a) * t;
+    for (let y = 0; y < size; y++) {
+        const ty = y / size;
+        const bg = [mix(15, 10, ty), mix(37, 22, ty), mix(71, 40, ty)];
+        const bl = [mix(96, 29, ty), mix(165, 78, ty), mix(250, 216, ty)];
+        for (let x = 0; x < size; x++) {
+            let cov = 0;
+            for (let sy = 0; sy < S; sy++) for (let sx = 0; sx < S; sx++)
+                if (inPoly((x + (sx + 0.5) / S) / size, (y + (sy + 0.5) / S) / size, poly)) cov++;
+            cov /= S * S;
+            const o = y * stride + 1 + x * 3;
+            for (let k = 0; k < 3; k++) raw[o + k] = Math.round(bg[k] * (1 - cov) + bl[k] * cov);
+        }
+    }
+    const ihdr = Buffer.alloc(13);
+    ihdr.writeUInt32BE(size, 0); ihdr.writeUInt32BE(size, 4); ihdr[8] = 8; ihdr[9] = 2;
+    return Buffer.concat([
+        Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+        chunk("IHDR", ihdr), chunk("IDAT", zlib.deflateSync(raw)), chunk("IEND", Buffer.alloc(0)),
+    ]);
+}
+const ICONS = { 180: makeIcon(180), 192: makeIcon(192), 512: makeIcon(512) };
+
+/* ---------- ملفات الـ PWA ---------- */
+const MANIFEST = {
+    name: "فلاش | تجربة الإشعارات", short_name: "فلاش",
+    start_url: "/", scope: "/", display: "standalone",
+    background_color: "#0a1628", theme_color: "#0a1628", lang: "ar", dir: "rtl",
+    icons: [
+        { src: "/icon-192.png", sizes: "192x192", type: "image/png" },
+        { src: "/icon-512.png", sizes: "512x512", type: "image/png" },
+    ],
 };
-function recStop() { if (room.rec) { room.rec = null; } }
-function drop(uid) {
-    if (!room.people.has(uid)) return;
-    room.people.delete(uid); pending.delete(uid);
-    const r = conns.get(uid); if (r) { try { r.end(); } catch (e) {} } conns.delete(uid);
-    if (room.rec && room.rec.uid === uid) recStop();
-    if (!room.people.size) room.chat = [];
-    push();
-}
 
-app.post("/api/join", (req, res) => {
-    const name = String(req.body.name || "").trim().slice(0, 24);
-    if (!name) return res.status(400).json({ error: "اكتب اسمك" });
-    const uid = crypto.randomBytes(6).toString("hex");
-    const existing = [...room.people.keys()];
-    room.people.set(uid, { uid, name, muted: false, joinedAt: Date.now() });
-    push();
-    res.json({ uid, state: state(), existing, chat: room.chat,
-        ice: [{ urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] }].concat(process.env.TURN_URL ? [{ urls: process.env.TURN_URL.split(","), username: process.env.TURN_USER || "", credential: process.env.TURN_PASS || "" }] : []) });
+const SW = String.raw`
+self.addEventListener("install", function () { self.skipWaiting(); });
+self.addEventListener("activate", function (e) { e.waitUntil(self.clients.claim()); });
+self.addEventListener("push", function (e) {
+  var d = {};
+  try { d = e.data ? e.data.json() : {}; } catch (err) { d = { body: e.data ? e.data.text() : "" }; }
+  e.waitUntil(self.registration.showNotification(d.title || "فلاش", {
+    body: d.body || "",
+    icon: "/icon-192.png",
+    badge: "/icon-192.png",
+    lang: "ar", dir: "rtl",
+    data: { url: d.url || "/" }
+  }));
 });
-app.get("/api/events", (req, res) => {
-    const uid = String(req.query.uid || "");
-    if (!room.people.has(uid)) return res.status(401).end();
-    res.set({ "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive", "X-Accel-Buffering": "no" });
-    res.flushHeaders(); conns.set(uid, res);
-    (pending.get(uid) || []).forEach(p => res.write("data: " + JSON.stringify(p) + "\n\n")); pending.delete(uid);
-    const ka = setInterval(() => res.write(": ka\n\n"), 20000);
-    req.on("close", () => { clearInterval(ka); if (conns.get(uid) === res) { conns.delete(uid); setTimeout(() => { if (!conns.has(uid)) drop(uid); }, 8000); } });
+self.addEventListener("notificationclick", function (e) {
+  e.notification.close();
+  var url = (e.notification.data && e.notification.data.url) || "/";
+  e.waitUntil(self.clients.matchAll({ type: "window", includeUncontrolled: true }).then(function (list) {
+    for (var i = 0; i < list.length; i++) { if ("focus" in list[i]) return list[i].focus(); }
+    return self.clients.openWindow(url);
+  }));
 });
-app.post("/api/signal", (req, res) => { const u = auth(req, res); if (!u) return; if (room.people.has(req.body.to)) send(req.body.to, { t: "signal", from: u, data: req.body.data }); res.json({ ok: true }); });
-app.post("/api/leave", (req, res) => { const u = auth(req, res); if (u) drop(u); res.json({ ok: true }); });
-// الكل كبار: عندهم كل الصلاحيات (كتم، طرد، أوضاع الروم)
-app.post("/api/mode", (req, res) => { if (!auth(req, res)) return; if (["open", "mute"].includes(req.body.mode)) room.mode = req.body.mode; push(); res.json({ ok: true }); });
-app.post("/api/mute", (req, res) => { if (!auth(req, res)) return; const p = room.people.get(req.body.target); if (p) { p.muted = !!req.body.on; push(); } res.json({ ok: true }); });
-app.post("/api/kick", (req, res) => { if (!auth(req, res)) return; const t = req.body.target; if (room.people.has(t)) { send(t, { t: "kicked" }); setTimeout(() => drop(t), 300); } res.json({ ok: true }); });
-app.post("/api/chat", (req, res) => {
-    const u = auth(req, res); if (!u) return; const text = String(req.body.text || "").trim().slice(0, 500); if (!text) return res.json({ ok: true });
-    const msg = { name: room.people.get(u).name, text, at: Date.now() }; room.chat.push(msg); room.chat = room.chat.slice(-100);
-    for (const k of room.people.keys()) send(k, { t: "chat", msg }); res.json({ ok: true });
-});
-// ---------- تسجيل الروم ----------
-app.post("/api/rec/start", (req, res) => {
-    const u = auth(req, res); if (!u) return; if (room.rec) return res.json({ ok: false });
-    const ext = /mp4/.test(String(req.body.mime)) ? ".m4a" : ".webm", sid = Date.now() + "-" + u + ext;
-    room.rec = { sid, uid: u }; fs.writeFileSync(path.join(REC_DIR, sid), ""); push(); res.json({ ok: true, sid });
-});
-app.post("/api/rec/chunk", express.raw({ type: "*/*", limit: "3mb" }), (req, res) => {
-    const sid = path.basename(String(req.query.sid || ""));
-    if (!room.rec || room.rec.sid !== sid || room.rec.uid !== req.query.uid || !Buffer.isBuffer(req.body)) return res.status(404).json({ error: "no" });
-    fs.appendFileSync(path.join(REC_DIR, sid), req.body); res.json({ ok: true });
-});
-app.post("/api/rec/stop", (req, res) => { const u = auth(req, res); if (u && room.rec && room.rec.uid === u) { recStop(); push(); } res.json({ ok: true }); });
-app.get("/api/rec", (req, res) => res.json(fs.readdirSync(REC_DIR).filter(f => /\.(webm|m4a)$/.test(f)).sort().reverse().map(f => ({ f, at: parseInt(f, 10), kb: Math.round(fs.statSync(path.join(REC_DIR, f)).size / 1024) }))));
-app.get("/api/rec/:f", (req, res) => res.sendFile(path.join(REC_DIR, path.basename(req.params.f))));
+`;
 
-app.get("/", (req, res) => res.type("html").send(PAGE));
-app.listen(PORT, () => console.log("📡 تردد القطاعات شغال على المنفذ " + PORT));
-
-const PAGE = String.raw`<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>📡 تردد القطاعات</title>
+/* ---------- الصفحة ---------- */
+const PAGE = String.raw`<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>فلاش | تجربة الإشعارات</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="فلاش">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="theme-color" content="#0a1628">
+<link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
 <style>
-:root{--bg1:#0a1628;--bg2:#0d1f3c;--border:rgba(59,130,246,.25);--gold:#3b82f6;--gold-soft:#60a5fa;--green:#1d4ed8;--green2:#3b82f6;--red:#ef4444;--amber:#eab308;--text:#e2e8f0;--muted:#64748b}
-*{box-sizing:border-box;margin:0;padding:0;font-family:'Tajawal','Tahoma','Segoe UI',sans-serif}
-body{background:linear-gradient(135deg,#0a1628 0%,#0d1f3c 40%,#0a2744 70%,#0d3060 100%);color:var(--text);min-height:100vh}
-.btn{border:none;border-radius:8px;padding:.45rem .9rem;font-size:13px;font-weight:700;cursor:pointer;color:#fff;background:linear-gradient(135deg,var(--gold),var(--green))}
-.btn.gray{background:rgba(255,255,255,.1)}.btn.red{background:#b91c1c}.btn.sm{padding:.3rem .5rem;font-size:12px}
-#login{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}
-.card{background:linear-gradient(160deg,#0d1f3c,#0a1628);border:1px solid var(--border);border-radius:16px;padding:26px;width:100%;max-width:380px;text-align:center;box-shadow:0 15px 45px rgba(0,0,0,.5)}
-.card h1{color:var(--gold-soft);font-size:24px;margin-bottom:6px}.card p{color:var(--muted);font-size:13px;margin-bottom:16px;line-height:1.8}
-.card input{width:100%;background:rgba(255,255,255,.06);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:11px 12px;font-size:15px;margin-bottom:12px}
-.card .btn{width:100%;padding:12px;font-size:15px}
-#room{position:fixed;inset:0;z-index:4000;background:linear-gradient(160deg,#060e1c,#0a1628);overflow-y:auto;padding:14px 14px 120px;display:none}
-.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:8px;flex-wrap:wrap}
-.head b{color:var(--gold-soft);font-size:17px}.head span{font-size:12px;color:var(--muted)}
-.modes{display:flex;gap:8px;margin-bottom:8px}
-.mode{flex:1;padding:10px 8px;border-radius:10px;border:1px solid var(--border);background:rgba(255,255,255,.05);color:#94a3b8;font-size:13px;font-weight:700;cursor:pointer}
-.mode.on{background:var(--green2);color:#fff;border-color:var(--green2)}
-.note{text-align:center;font-size:13px;color:var(--muted);margin:8px 0 12px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px}
-.tile{background:rgba(255,255,255,.05);border:2px solid transparent;border-radius:14px;padding:14px 8px 10px;text-align:center;cursor:pointer;transition:border-color .15s,box-shadow .15s}
-.tile.speaking{border-color:#22c55e;box-shadow:0 0 0 3px rgba(34,197,94,.25)}
-.av{width:56px;height:56px;border-radius:50%;margin:0 auto 8px;background:linear-gradient(135deg,#1d4ed8,#60a5fa);display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:800;color:#fff}
-.nm{font-size:13px;font-weight:700;word-break:break-word}.rl{font-size:11px;color:var(--muted);margin:3px 0}.ic{font-size:16px;min-height:22px}
-.tile .btn{margin-top:6px;width:100%}
-.bar{position:fixed;bottom:0;left:0;right:0;z-index:4100;display:flex;justify-content:center;align-items:center;gap:12px;padding:14px;background:rgba(5,15,30,.95);border-top:1px solid rgba(59,130,246,.3);flex-wrap:wrap}
-.ob{min-width:100px;padding:12px 16px;border-radius:30px;border:1px solid var(--border);background:rgba(255,255,255,.08);color:#fff;font-size:14px;font-weight:700;cursor:pointer}
-.ob.leave{background:#ef4444;border-color:#ef4444}
-#ptt{min-width:190px;padding:16px 22px;font-size:17px;background:var(--green);border-color:var(--gold-soft);touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
-#ptt.live{background:#16a34a;border-color:#4ade80;box-shadow:0 0 0 6px rgba(34,197,94,.3)}
-.chatbtn{position:fixed;top:10px;left:10px;z-index:4150;padding:11px 20px;border-radius:30px;border:1px solid #60a5fa;background:#1d4ed8;color:#fff;font-size:15px;font-weight:800;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.45)}
-.dot{display:inline-block;min-width:18px;height:18px;line-height:18px;border-radius:9px;background:#ef4444;font-size:11px;margin-right:6px;padding:0 5px;text-align:center}
-#sheet{position:fixed;left:0;right:0;bottom:0;height:62vh;z-index:4400;background:linear-gradient(160deg,#0d1f3c,#0a1628);border-top:1px solid var(--border);border-radius:18px 18px 0 0;display:none;flex-direction:column;padding:12px}
-#sheet.open{display:flex}#cl{flex:1;overflow-y:auto;font-size:13px;line-height:1.9;margin:8px 0}
-.ci{display:flex;gap:8px}.ci input{flex:1;background:rgba(255,255,255,.06);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px;font-size:14px}
-#recs{position:fixed;inset:0;z-index:4500;background:rgba(5,10,20,.85);display:none;align-items:center;justify-content:center;padding:16px}
-#recs>div{background:#0d1f3c;border:1px solid var(--border);border-radius:14px;padding:16px;width:100%;max-width:420px;max-height:80vh;overflow-y:auto}
-#recs audio{width:100%;margin:4px 0 10px}
-#toast{position:fixed;top:14px;left:50%;transform:translateX(-50%);background:#1e293b;border:1px solid var(--border);padding:10px 18px;border-radius:10px;z-index:9000;font-size:14px;display:none}
-</style></head><body>
-<div id="login"><div class="card"><h1>📡 تردد القطاعات</h1>
-<p>موقع تجربة — الكل كبار وعندهم كل الصلاحيات.<br>اكتب اسمك وادخل الروم الصوتي.</p>
-<input id="nm" maxlength="24" placeholder="اسمك" onkeydown="if(event.key==='Enter')join()">
-<button class="btn" onclick="join()">🎙️ دخول الروم الصوتي</button></div></div>
-<div id="room">
-<div class="head"><b>📡 تردد القطاعات — الروم الصوتي</b><span id="cnt"></span>
-<span><button class="btn gray sm" onclick="showRecs()">📼 التسجيلات</button></span></div>
-<div class="modes"><button class="mode" id="m-open" onclick="setMode('open')">🔊 الكل يتكلم ويسمع</button><button class="mode" id="m-mute" onclick="setMode('mute')">🔇 الروم صامت</button></div>
-<div class="note" id="note"></div><div class="grid" id="grid"></div>
-<div class="bar"><button class="ob" id="ptt">🎙️ اضغط واستمر للتحدث</button><button class="ob" style="background:#334155" onclick="openPip()">🪟 نافذة عائمة</button><button class="ob leave" onclick="leave()">🚪 خروج</button></div>
-<button class="chatbtn" onclick="chatToggle()">💬 شات<span id="cd"></span></button>
-<div id="sheet"><div style="display:flex;justify-content:space-between;align-items:center"><b style="color:var(--gold-soft)">💬 الشات</b><button class="btn gray sm" onclick="chatToggle()">↩️ رجوع للروم</button></div>
-<div id="cl"></div><div class="ci"><input id="ci" maxlength="500" placeholder="اكتب رابط أو تعليمات أو سؤال..." onkeydown="if(event.key==='Enter')chatSend()"><button class="btn" onclick="chatSend()">إرسال</button></div></div>
-<div id="aud" style="display:none"></div></div>
-<div id="recs" onclick="if(event.target===this)this.style.display='none'"><div><b style="color:var(--gold-soft)">📼 تسجيلات الروم</b><div id="rl" style="margin-top:10px"></div></div></div>
+:root{
+  --bg1:#0a1628; --bg2:#0d1f3c; --panel:rgba(255,255,255,0.04); --border:rgba(59,130,246,0.25);
+  --blue:#3b82f6; --blue-soft:#60a5fa; --blue-deep:#1d4ed8;
+  --green:#22c55e; --red:#ef4444; --amber:#eab308; --text:#e2e8f0; --muted:#64748b;
+}
+*{box-sizing:border-box;margin:0;padding:0;font-family:'Tajawal','Tahoma','Segoe UI',sans-serif;-webkit-tap-highlight-color:transparent}
+html,body{min-height:100%}
+body{background:linear-gradient(160deg,var(--bg1),var(--bg2)) fixed;color:var(--text);
+  padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
+main{max-width:520px;margin:0 auto;padding:20px 16px 40px}
+header{display:flex;align-items:center;gap:12px;margin-bottom:22px}
+header svg{width:38px;height:38px;flex:none}
+header h1{font-size:26px;font-weight:800;line-height:1.1}
+header p{font-size:13px;color:var(--muted);margin-top:3px}
+#conn{margin-inline-start:auto;font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
+#conn i{width:8px;height:8px;border-radius:50%;background:var(--muted);display:inline-block}
+#conn.ok i{background:var(--green)}
+h2{font-size:16px;font-weight:700;margin:26px 0 10px}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:16px}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.chip{font-size:12px;font-weight:500;padding:3px 10px;border-radius:99px;background:rgba(59,130,246,0.15);color:var(--blue-soft)}
+.chip.on{background:rgba(34,197,94,0.15);color:#4ade80}
+.chip.off{background:rgba(100,116,139,0.18);color:var(--muted)}
+.chip.warn{background:rgba(234,179,8,0.15);color:var(--amber)}
+.me-name{font-weight:700;font-size:17px}
+.btn{width:100%;border:none;border-radius:12px;padding:13px;font-size:15px;font-weight:700;cursor:pointer;color:#fff;
+  background:linear-gradient(135deg,var(--blue),var(--blue-deep));margin-top:14px}
+.btn.sec{background:transparent;border:1px solid var(--border);color:var(--blue-soft)}
+.btn.sm{width:auto;margin:0;padding:8px 16px;font-size:13px;border-radius:10px}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn:focus-visible,input:focus-visible{outline:2px solid var(--blue-soft);outline-offset:2px}
+.row2{display:flex;gap:8px}
+.row2 .btn{margin-top:10px}
+.hint{font-size:13px;color:var(--muted);margin-top:10px;line-height:1.7}
+.guide{border-color:rgba(234,179,8,0.45);background:rgba(234,179,8,0.06)}
+.guide b{color:var(--amber)}
+.guide ol{padding-inline-start:20px;margin-top:8px;line-height:2;font-size:14px}
+input{width:100%;background:rgba(255,255,255,0.06);border:1px solid var(--border);border-radius:10px;color:var(--text);
+  padding:11px 12px;font-size:14px;margin-bottom:8px}
+input::placeholder{color:var(--muted)}
+.dev-head{display:flex;align-items:center;justify-content:space-between;margin:26px 0 10px}
+.dev-head h2{margin:0}
+.dev-head span{font-size:13px;color:var(--muted)}
+.dev-list{background:var(--panel);border:1px solid var(--border);border-radius:14px;overflow:hidden}
+.dev{display:flex;align-items:center;gap:12px;padding:14px 16px}
+.dev + .dev{border-top:1px solid var(--border)}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--muted);flex:none}
+.dot.on{background:var(--green);box-shadow:0 0 0 0 rgba(34,197,94,.6);animation:pulse 2s infinite}
+@keyframes pulse{70%{box-shadow:0 0 0 8px rgba(34,197,94,0)}100%{box-shadow:0 0 0 0 rgba(34,197,94,0)}}
+.dev-main{flex:1;min-width:0}
+.dev-name{font-weight:700;font-size:15px;display:flex;align-items:center;gap:8px}
+.dev-name small{font-size:11px;font-weight:500;color:var(--blue-soft);background:rgba(59,130,246,.15);padding:1px 8px;border-radius:99px}
+.empty{padding:22px;text-align:center;color:var(--muted);font-size:14px}
+#toast{position:fixed;left:50%;bottom:calc(24px + env(safe-area-inset-bottom));transform:translate(-50%,20px);opacity:0;
+  background:#10264a;border:1px solid var(--border);color:var(--text);padding:11px 18px;border-radius:12px;font-size:14px;
+  transition:.25s;pointer-events:none;max-width:90%;text-align:center;z-index:50}
+#toast.show{opacity:1;transform:translate(-50%,0)}
+
+/* شاشة الدخول */
+#splash{position:fixed;inset:0;z-index:100;background:radial-gradient(circle at 50% 42%,#12305e 0%,var(--bg1) 62%);
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;transition:opacity .45s}
+#splash.out{opacity:0;pointer-events:none}
+#splash svg{width:120px;height:120px;filter:drop-shadow(0 0 22px rgba(59,130,246,.55))}
+#splash path{fill:url(#bg);fill-opacity:0;stroke:var(--blue-soft);stroke-width:1.6;stroke-linejoin:round;
+  stroke-dasharray:1;stroke-dashoffset:1;animation:draw .7s ease-out forwards,fill .4s .6s ease-out forwards}
+#splash .sname{font-size:34px;font-weight:800;letter-spacing:.5px;opacity:0;animation:fade .4s .75s forwards}
+@keyframes draw{to{stroke-dashoffset:0}}
+@keyframes fill{to{fill-opacity:1;stroke-opacity:0}}
+@keyframes fade{to{opacity:1}}
+@media (prefers-reduced-motion:reduce){
+  #splash path{animation:none;stroke-dashoffset:0;fill-opacity:1}
+  #splash .sname{animation:none;opacity:1}
+  .dot.on{animation:none}
+  #splash,#toast{transition:none}
+}
+</style>
+</head>
+<body>
+
+<div id="splash">
+  <svg viewBox="0 0 100 100" aria-hidden="true">
+    <defs><linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient></defs>
+    <path pathLength="1" d="M58 8 L26 55 L46 55 L40 92 L74 42 L54 42 L64 8 Z"/>
+  </svg>
+  <div class="sname">فلاش</div>
+</div>
+
+<main>
+  <header>
+    <svg viewBox="0 0 100 100" aria-hidden="true">
+      <defs><linearGradient id="hg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient></defs>
+      <path fill="url(#hg)" d="M58 8 L26 55 L46 55 L40 92 L74 42 L54 42 L64 8 Z"/>
+    </svg>
+    <div><h1>فلاش</h1><p>تجربة الإشعارات خارج الموقع</p></div>
+    <div id="conn"><i></i><span>يتصل...</span></div>
+  </header>
+
+  <div id="guide" class="panel guide" hidden>
+    <b>على الآيفون لازم تثبّت الموقع كتطبيق أول</b>
+    <ol>
+      <li>افتح الموقع من سفاري</li>
+      <li>اضغط زر المشاركة</li>
+      <li>اختر «إضافة إلى الشاشة الرئيسية»</li>
+      <li>خلّ «فتح كتطبيق ويب» شغّال ثم «إضافة»</li>
+      <li>افتح الموقع من الأيقونة الجديدة وفعّل الإشعارات</li>
+    </ol>
+  </div>
+
+  <h2>جهازك</h2>
+  <div class="panel">
+    <div class="me-name" id="meName">...</div>
+    <div class="chips" id="meChips"></div>
+    <div id="meAction"></div>
+    <div class="hint" id="meHint"></div>
+  </div>
+
+  <h2>نص الإشعار</h2>
+  <input id="title" value="فلاش" maxlength="60" placeholder="العنوان">
+  <input id="body" value="رد عليك الإداري على تكتك ⚡" maxlength="160" placeholder="النص">
+
+  <div class="dev-head"><h2>الأجهزة</h2><span id="count"></span></div>
+  <div class="dev-list" id="list"><div class="empty">...</div></div>
+  <button class="btn" id="sendAll" disabled>إرسال للجميع</button>
+</main>
+
 <div id="toast"></div>
+
 <script>
-var ME=null,S=null,ICE=[],P={},stream,mic,ev,ac,rdest,speaking={},an={},unread=0,pttOn=false,rec=null,recBusy=false,pipWin=null,pipV=null,pipC=null;
-function $(i){return document.getElementById(i)}
-function esc(s){return String(s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
-function toast(m){var t=$('toast');t.textContent=m;t.style.display='block';clearTimeout(toast.t);toast.t=setTimeout(function(){t.style.display='none'},2800)}
-function api(u,b){return fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({uid:ME&&ME.uid},b||{}))}).then(function(r){return r.json().then(function(d){if(!r.ok)throw new Error(d.error||'خطأ');return d})})}
-function who(u){return S.people.filter(function(p){return p.uid===u})[0]}
-async function join(){
- var name=$('nm').value.trim();if(!name)return toast('اكتب اسمك');
- if(!window.RTCPeerConnection||!navigator.mediaDevices)return toast('المتصفح ما يدعم الصوت (لازم HTTPS)');
- extStart();
- try{stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false})}catch(e){extStop();return toast('اسمح للموقع باستخدام المايك')}
- mic=stream.getAudioTracks()[0];mic.enabled=false;
- try{ME=await api('/api/join',{name:name})}catch(e){extStop();return toast(e.message)}
- S=ME.state;ICE=ME.ice;
- ac=new(window.AudioContext||window.webkitAudioContext)();ac.resume();rdest=ac.createMediaStreamDestination();
- ac.createMediaStreamSource(stream).connect(rdest);
- $('login').style.display='none';$('room').style.display='block';document.body.style.overflow='hidden';
- watch(ME.uid,stream);ME.chat.forEach(addChat);
- ev=new EventSource('/api/events?uid='+ME.uid);ev.onmessage=function(e){onMsg(JSON.parse(e.data))};
- ME.existing.forEach(function(u){peer(u,true)});
- bind($('ptt'));paint();pipSetup();extSetup();setInterval(level,150);
-}
-function onMsg(m){
- if(m.t==='state'){S=m.s;Object.keys(P).forEach(function(u){if(!who(u)){P[u].pc.close();P[u].el.remove();delete P[u]}});paint();recCheck()}
- else if(m.t==='signal')onSignal(m.from,m.data);
- else if(m.t==='chat'){addChat(m.msg);if(!$('sheet').classList.contains('open')){unread++;$('cd').innerHTML='<span class="dot">'+unread+'</span>'}}
- else if(m.t==='kicked'){toast('تم طردك من الروم');leave(true)}
-}
-function sig(to,data){api('/api/signal',{to:to,data:data}).catch(function(){})}
-function peer(uid,init){
- var pc=new RTCPeerConnection({iceServers:ICE}),p={uid:uid,pc:pc,el:document.createElement('audio'),pend:[],ready:false};
- p.el.autoplay=true;p.el.setAttribute('playsinline','');$('aud').appendChild(p.el);
- stream.getTracks().forEach(function(t){pc.addTrack(t,stream)});
- pc.onicecandidate=function(e){if(e.candidate)sig(uid,{ice:e.candidate})};
- pc.ontrack=function(e){p.stream=e.streams[0]||new MediaStream([e.track]);p.el.srcObject=p.stream;p.el.play().catch(function(){});
-  watch(uid,p.stream);try{ac.createMediaStreamSource(p.stream).connect(rdest)}catch(x){}applyMute()};
- P[uid]=p;
- if(init)pc.createOffer().then(function(o){return pc.setLocalDescription(o)}).then(function(){sig(uid,{sdp:pc.localDescription})});
- return p;
-}
-async function onSignal(from,d){
- var p=P[from]||peer(from,false);
- if(d.sdp){await p.pc.setRemoteDescription(d.sdp);p.ready=true;p.pend.forEach(function(c){p.pc.addIceCandidate(c).catch(function(){})});p.pend=[];
-  if(d.sdp.type==='offer'){var a=await p.pc.createAnswer();await p.pc.setLocalDescription(a);sig(from,{sdp:p.pc.localDescription})}}
- else if(d.ice){p.ready?p.pc.addIceCandidate(d.ice).catch(function(){}):p.pend.push(d.ice)}
-}
-function applyMute(){Object.keys(P).forEach(function(u){var w=who(u);P[u].el.muted=!w||w.muted||S.mode==='mute'})}
-/* ---------- المايك: اضغط واستمر ---------- */
-function ptt(on){
- if(on){var me=who(ME.uid);if(me&&me.muted)return toast('أحد الكبار كاتم المايك عنك');if(S.mode==='mute')return toast('الروم صامت')}
- mic.enabled=on;pttOn=on;pttPaint();
-}
-function bind(b){
- b.addEventListener('pointerdown',function(e){e.preventDefault();try{b.setPointerCapture(e.pointerId)}catch(x){}ptt(true)});
- ['pointerup','pointercancel','lostpointercapture'].forEach(function(n){b.addEventListener(n,function(){ptt(false)})});
- b.addEventListener('contextmenu',function(e){e.preventDefault()});
-}
-document.addEventListener('keydown',function(e){if(e.code==='Space'&&ME&&!e.repeat&&e.target.tagName!=='INPUT'){e.preventDefault();ptt(true)}});
-document.addEventListener('keyup',function(e){if(e.code==='Space'&&ME)ptt(false)});
-function pttPaint(){
- var b=$('ptt');b.classList.toggle('live',pttOn);b.textContent=pttOn?'🟢 تتكلم الحين... (فك لإيقاف المايك)':'🎙️ اضغط واستمر للتحدث';
- if(pipWin){var pb=pipWin.document.getElementById('pb');if(pb){pb.style.background=pttOn?'#16a34a':'#1d4ed8';pb.innerHTML=pttOn?'🟢<br>المايك شغال<br><span style="font-size:15px">اضغط للقفل</span>':'🔇<br>المايك مقفل<br><span style="font-size:15px">اضغط للتشغيل</span>'}}
- pipDraw();extPaint();
- if(pipV){try{if(pttOn&&pipV.paused)pipV.play().catch(function(){});if(!pttOn&&!pipV.paused)pipV.pause()}catch(e){}}
-}
-/* ---------- النافذة العائمة فوق يمين ---------- */
-var pipBusy=false,pipTimer=null,pipPV=null;
-function pipClean(){
- try{if(pipV&&pipV.webkitPresentationMode==='picture-in-picture')pipV.webkitSetPresentationMode('inline')}catch(e){}
- pipV=null;pipBusy=false;
-}
-function pipKill(){
- if(pipTimer){clearInterval(pipTimer);pipTimer=null}
- if(pipPV){try{pipPV.pause();pipPV.srcObject=null;pipPV.remove()}catch(e){}}
- pipPV=null;pipC=null;
-}
-function pipFail(auto,e){
- pipClean();
- if(!auto)toast('تعذر فتح النافذة العائمة'+(e&&e.name?' ('+e.name+')':''));
-}
-/* تجهيز الفيديو العائم مسبقاً (سفاري يبي الفتح فوراً بعد اللمسة، فنجهز كل شي قبل) */
-function pipPrep(){
- if(pipPV)return pipPV;
- var v=document.createElement('video');
- if(!(document.pictureInPictureEnabled&&v.requestPictureInPicture)&&typeof v.webkitSetPresentationMode!=='function')return null;
- var c=document.createElement('canvas');c.width=c.height=320;pipC=c;pipDraw();
- v.muted=true;v.playsInline=true;v.setAttribute('playsinline','');v.setAttribute('webkit-playsinline','');
- v.style.cssText='position:fixed;right:0;bottom:0;width:160px;height:160px;z-index:-1;pointer-events:none';
- v.srcObject=c.captureStream(10);document.body.appendChild(v);
- pipTimer=setInterval(pipDraw,100);
- try{navigator.mediaSession.setActionHandler('play',function(){ptt(true)});navigator.mediaSession.setActionHandler('pause',function(){ptt(false)})}catch(e){}
- v.addEventListener('leavepictureinpicture',function(){pipClean();ptt(false)});
- v.addEventListener('webkitpresentationmodechanged',function(){if(pipV===v&&v.webkitPresentationMode!=='picture-in-picture'){pipClean();ptt(false)}});
- v.addEventListener('play',function(){if(pipV===v&&!pttOn){ptt(true);if(!pttOn)v.pause()}});
- v.addEventListener('pause',function(){if(pipV===v&&pttOn)ptt(false)});
- pipPV=v;v.play().catch(function(){});
- return v;
-}
-async function openPip(auto){
- auto=(auto===true);
- if(pipWin||pipV||pipBusy)return;
- pipBusy=true;
- try{
-  if(window.documentPictureInPicture){
-   var w=null;
-   try{w=await documentPictureInPicture.requestWindow({width:300,height:300})}catch(e){w=null}
-   if(w){
-    pipWin=w;
-    try{pipWin.moveTo(screen.availLeft+screen.availWidth-320,screen.availTop+10)}catch(e){}
-    var d=pipWin.document;d.body.style.cssText='margin:0;background:#0a1628;display:flex;align-items:center;justify-content:center;overflow:hidden;direction:rtl;font-family:Tahoma,sans-serif';
-    d.body.innerHTML='<button id="pb" style="width:240px;height:240px;border-radius:50%;border:5px solid #60a5fa;background:#1d4ed8;color:#fff;font-size:24px;font-weight:800;touch-action:none;user-select:none;cursor:pointer">🔇<br>المايك مقفل<br><span style="font-size:15px">اضغط للتشغيل</span></button>';
-    d.getElementById('pb').addEventListener('click',extToggle);
-    pipWin.addEventListener('pagehide',function(){pipWin=null;ptt(false)});
-    pipBusy=false;return;
-   }
-   if(auto){pipBusy=false;return}
+(function () {
+  var $ = function (s) { return document.querySelector(s); };
+  var store = {
+    get: function (k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    set: function (k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+  };
+  var id = store.get("fl_id");
+  if (!id) {
+    id = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(16) + Math.random().toString(16).slice(2));
+    id = id.replace(/[^a-zA-Z0-9-]/g, "");
+    store.set("fl_id", id);
   }
-  await pipFallback(auto);
- }catch(e){pipFail(auto,e)}
- pipBusy=false;
-}
-function pipDraw(){
- if(!pipC)return;var x=pipC.getContext('2d');x.fillStyle=pttOn?'#16a34a':'#1d4ed8';x.fillRect(0,0,320,320);
- x.fillStyle='#fff';x.font='bold 30px Tahoma';x.textAlign='center';x.fillText(pttOn?'🟢 المايك شغال':'🎙️ المايك مقفل',160,160);x.font='18px Tahoma';x.fillText('زر التشغيل = تكلم / إيقاف = اقفل',160,210);
-}
-async function pipFallback(auto){ /* سفاري وغيره: فيديو عائم + أزرار التشغيل/الإيقاف (ضغطة تشغّل وضغطة تقفل، ما فيه ضغط مستمر) */
- var v=pipPrep();
- if(!v){if(!auto)toast('هذا المتصفح ما يدعم النافذة العائمة — استخدم Chrome أو Edge');return}
- var step='play';
- try{
-  if(v.paused)v.play().catch(function(){});
-  if(!(v.videoWidth>0)){step='frames';for(var i=0;i<30&&!(v.videoWidth>0);i++)await new Promise(function(r){setTimeout(r,100)})}
-  step='pip';
-  var done=false,err=null;
-  if(document.pictureInPictureEnabled&&v.requestPictureInPicture){try{await v.requestPictureInPicture();done=true}catch(e){err=e}}
-  if(!done&&typeof v.webkitSetPresentationMode==='function'){
-   step='webkit';v.webkitSetPresentationMode('picture-in-picture');
-   await new Promise(function(r){setTimeout(r,600)});
-   done=(v.webkitPresentationMode==='picture-in-picture');
+
+  var ua = navigator.userAgent;
+  var isIOS = /iPhone|iPad|iPod/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  var standalone = (window.matchMedia && matchMedia("(display-mode: standalone)").matches) || navigator.standalone === true;
+  var supportsPush = ("serviceWorker" in navigator) && ("PushManager" in window) && ("Notification" in window);
+
+  function guessName() {
+    var t = "جهاز";
+    if (/iPhone/.test(ua)) t = "آيفون";
+    else if (/iPad/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)) t = "آيباد";
+    else if (/Android/.test(ua)) t = "أندرويد";
+    else if (/Windows/.test(ua)) t = "ويندوز";
+    else if (/Mac/.test(ua)) t = "ماك";
+    else if (/Linux/.test(ua)) t = "لينكس";
+    return t + " #" + id.slice(0, 4);
   }
-  if(!done)throw err||new Error('NotEntered');
-  pipV=v;v.pause(); /* المايك مقفل: الفيديو واقف، فتظهر لك أيقونة التشغيل = تكلم */
- }catch(e){var er=new Error(e&&e.message);er.name=((e&&e.name)||'Error')+'@'+step;throw er}
+  var myName = guessName();
+
+  var reg = null, mySub = null, vapidKey = null, devices = [], ready = false;
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+  function chip(text, cls) { return el("span", "chip " + (cls || ""), text); }
+  var toastT;
+  function toast(msg) {
+    var t = $("#toast"); t.textContent = msg; t.classList.add("show");
+    clearTimeout(toastT); toastT = setTimeout(function () { t.classList.remove("show"); }, 2800);
+  }
+  function post(url, data) {
+    return fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) })
+      .then(function (r) { return r.json().catch(function () { return {}; }); });
+  }
+  function urlB64(s) {
+    var p = "=".repeat((4 - s.length % 4) % 4);
+    var b = atob((s + p).replace(/-/g, "+").replace(/_/g, "/"));
+    var a = new Uint8Array(b.length);
+    for (var i = 0; i < b.length; i++) a[i] = b.charCodeAt(i);
+    return a;
+  }
+
+  /* ---------- جهازك ---------- */
+  function renderMe() {
+    $("#meName").textContent = myName;
+    var chips = $("#meChips"); chips.textContent = "";
+    chips.appendChild(chip(standalone ? "تطبيق ويب" : "متصفح", standalone ? "on" : ""));
+    var act = $("#meAction"); act.textContent = "";
+    var hint = $("#meHint"); hint.textContent = "";
+    $("#guide").hidden = !(isIOS && !standalone);
+
+    if (!supportsPush) {
+      chips.appendChild(chip("الإشعارات غير مدعومة", "warn"));
+      hint.textContent = (isIOS && !standalone)
+        ? "ثبّت الموقع على الشاشة الرئيسية وافتحه من الأيقونة عشان تظهر لك الإشعارات."
+        : "هذا المتصفح ما يدعم إشعارات الويب.";
+      return;
+    }
+    if (Notification.permission === "denied") {
+      chips.appendChild(chip("الإشعارات محظورة", "warn"));
+      hint.textContent = "فعّلها من إعدادات الجهاز للموقع ثم ارجع.";
+      return;
+    }
+    if (mySub) {
+      chips.appendChild(chip("الإشعارات مفعّلة", "on"));
+      var row = el("div", "row2");
+      var t = el("button", "btn", "إشعار تجريبي لي");
+      t.onclick = function () { send(id); };
+      var o = el("button", "btn sec", "إيقاف");
+      o.onclick = disable;
+      row.appendChild(t); row.appendChild(o); act.appendChild(row);
+      hint.textContent = "تقدر تقفل التطبيق وتجيك الإشعارات.";
+    } else {
+      chips.appendChild(chip("الإشعارات مطفية", "off"));
+      var b = el("button", "btn", "فعّل الإشعارات");
+      b.disabled = !ready;
+      b.onclick = enable;
+      act.appendChild(b);
+    }
+  }
+
+  function enable() {
+    if (!ready) return;
+    Notification.requestPermission().then(function (perm) {
+      if (perm !== "granted") { renderMe(); toast("ما انعطى إذن الإشعارات"); return; }
+      return reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64(vapidKey) }).then(function (sub) {
+        mySub = sub; store.set("fl_vapid", vapidKey);
+        return post("/api/subscribe", { id: id, sub: sub.toJSON() });
+      }).then(function () { renderMe(); toast("تم تفعيل الإشعارات ✓"); });
+    }).catch(function (e) { toast("فشل التفعيل: " + (e && e.message ? e.message : e)); });
+  }
+  function disable() {
+    var p = mySub ? mySub.unsubscribe() : Promise.resolve();
+    p.then(function () { mySub = null; return post("/api/unsubscribe", { id: id }); }).then(renderMe);
+  }
+
+  /* ---------- قائمة الأجهزة ---------- */
+  function renderDevices() {
+    var list = $("#list"); list.textContent = "";
+    var online = devices.filter(function (d) { return d.online; }).length;
+    $("#count").textContent = online + " متصل الآن من " + devices.length;
+    var canAll = devices.some(function (d) { return d.push; });
+    $("#sendAll").disabled = !canAll;
+    if (!devices.length) { list.appendChild(el("div", "empty", "ما فيه أجهزة بعد")); return; }
+    devices.forEach(function (d) {
+      var row = el("div", "dev");
+      row.appendChild(el("span", "dot" + (d.online ? " on" : "")));
+      var main = el("div", "dev-main");
+      var nm = el("div", "dev-name", d.name);
+      if (d.id === id) nm.appendChild(el("small", "", "جهازك"));
+      main.appendChild(nm);
+      var chips = el("div", "chips");
+      chips.appendChild(chip(d.online ? "متصل" : "غير متصل", d.online ? "on" : "off"));
+      chips.appendChild(chip(d.standalone ? "تطبيق ويب" : "متصفح"));
+      chips.appendChild(chip(d.push ? "إشعارات مفعّلة" : "بدون إشعارات", d.push ? "on" : "off"));
+      main.appendChild(chips);
+      row.appendChild(main);
+      var b = el("button", "btn sm", "إرسال");
+      b.disabled = !d.push;
+      b.onclick = function () { send(d.id); };
+      row.appendChild(b);
+      list.appendChild(row);
+    });
+  }
+
+  function send(target) {
+    var title = $("#title").value.trim() || "فلاش";
+    var body = $("#body").value.trim();
+    var data = { title: title, body: body };
+    if (target === "all") data.all = true; else data.id = target;
+    post("/api/send", data).then(function (r) {
+      if (r.error) return toast(r.error);
+      if (r.sent) toast("انرسل إلى " + r.sent + " جهاز ✓");
+      else toast("ما انرسل لأي جهاز");
+      if (r.failed && r.failed.length) toast("فشل الإرسال لـ " + r.failed.map(function (f) { return f.name; }).join("، "));
+    }).catch(function () { toast("تعذر الاتصال بالسيرفر"); });
+  }
+  $("#sendAll").onclick = function () { send("all"); };
+
+  /* ---------- الاتصال المباشر ---------- */
+  function connect() {
+    var es = new EventSource("/api/stream?id=" + id + "&name=" + encodeURIComponent(myName) + "&sa=" + (standalone ? 1 : 0));
+    var c = $("#conn");
+    es.onopen = function () { c.className = "ok"; c.lastChild.textContent = "متصل"; };
+    es.onerror = function () { c.className = ""; c.lastChild.textContent = "يعيد الاتصال..."; };
+    es.addEventListener("devices", function (e) { devices = JSON.parse(e.data); renderDevices(); });
+  }
+
+  /* ---------- البداية ---------- */
+  renderMe(); connect();
+
+  if (supportsPush) {
+    navigator.serviceWorker.register("/sw.js").then(function () { return navigator.serviceWorker.ready; })
+      .then(function (r) { reg = r; return fetch("/api/vapid").then(function (x) { return x.json(); }); })
+      .then(function (j) {
+        vapidKey = j.key;
+        return reg.pushManager.getSubscription();
+      }).then(function (sub) {
+        if (sub && store.get("fl_vapid") && store.get("fl_vapid") !== vapidKey) {
+          return sub.unsubscribe().then(function () { return null; });
+        }
+        return sub;
+      }).then(function (sub) {
+        mySub = sub; ready = true;
+        if (sub) post("/api/subscribe", { id: id, sub: sub.toJSON() });
+        renderMe();
+      }).catch(function (e) { toast("تعذر تجهيز الإشعارات"); });
+  }
+
+  /* شاشة الدخول */
+  setTimeout(function () {
+    var s = $("#splash"); s.classList.add("out");
+    setTimeout(function () { s.remove(); }, 500);
+  }, 1500);
+})();
+</script>
+</body>
+</html>`;
+
+/* ---------- السيرفر ---------- */
+const app = express();
+app.set("trust proxy", 1);
+app.use(express.json({ limit: "20kb" }));
+
+app.get("/", (req, res) => { res.set("Cache-Control", "no-cache"); res.type("html").send(PAGE); });
+app.get("/manifest.json", (req, res) => res.type("application/manifest+json").send(JSON.stringify(MANIFEST)));
+app.get("/sw.js", (req, res) => { res.set({ "Content-Type": "application/javascript", "Cache-Control": "no-cache", "Service-Worker-Allowed": "/" }); res.send(SW); });
+for (const n of [180, 192, 512]) app.get("/icon-" + n + ".png", (req, res) => { res.set("Cache-Control", "public, max-age=86400"); res.type("png").send(ICONS[n]); });
+app.get("/api/vapid", (req, res) => res.json({ key: vapid.publicKey }));
+
+app.get("/api/stream", (req, res) => {
+    const id = String(req.query.id || "");
+    if (!validId(id)) return res.status(400).end();
+    upsert(id, req.query.name, req.query.sa === "1");
+    res.set({ "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no" });
+    res.flushHeaders();
+    res.write("retry: 3000\n\n");
+
+    if (!conns.has(id)) conns.set(id, new Set());
+    conns.get(id).add(res);
+    pendingOff.delete(id);
+    streams.add(res);
+    broadcast();
+
+    const hb = setInterval(() => { try { res.write(": ping\n\n"); } catch (e) {} }, 20000);
+    req.on("close", () => {
+        clearInterval(hb);
+        streams.delete(res);
+        const set = conns.get(id);
+        if (set) set.delete(res);
+        if (!set || set.size === 0) {
+            pendingOff.add(id);
+            setTimeout(() => {
+                if (conns.get(id) && conns.get(id).size > 0) return;
+                pendingOff.delete(id);
+                const d = devices.get(id); if (d) { d.lastSeen = Date.now(); saveSoon(); }
+                broadcast();
+            }, 4000);
+        }
+    });
+});
+
+app.post("/api/subscribe", (req, res) => {
+    const { id, sub } = req.body || {};
+    if (!validId(id) || !sub || typeof sub.endpoint !== "string" || !/^https:\/\//.test(sub.endpoint) || !sub.keys || !sub.keys.p256dh || !sub.keys.auth)
+        return res.status(400).json({ error: "بيانات غير صالحة" });
+    const d = devices.get(id) || upsert(id, "جهاز", false);
+    d.sub = { endpoint: sub.endpoint, keys: { p256dh: String(sub.keys.p256dh), auth: String(sub.keys.auth) } };
+    saveSoon(); broadcast();
+    res.json({ ok: true });
+});
+
+app.post("/api/unsubscribe", (req, res) => {
+    const d = devices.get((req.body || {}).id);
+    if (d) { d.sub = null; saveSoon(); broadcast(); }
+    res.json({ ok: true });
+});
+
+const hits = new Map();
+function limited(ip) {
+    const now = Date.now(), a = (hits.get(ip) || []).filter(t => now - t < 60000);
+    a.push(now); hits.set(ip, a);
+    return a.length > 40;
 }
-function pipSetup(){
- if(!window.documentPictureInPicture)pipPrep();
- try{navigator.mediaSession.metadata=new MediaMetadata({title:'تردد القطاعات — الروم الصوتي'});navigator.mediaSession.playbackState='playing';
-  navigator.mediaSession.setActionHandler('enterpictureinpicture',function(){openPip(true)})}catch(e){}
- /* فتح تلقائي صامت عند الطلعة من الصفحة (المتصفح يمنعه بدون لمسة، فلو فشل ما يطلع أي رسالة) */
- document.addEventListener('visibilitychange',function(){if(document.hidden&&ME&&navigator.userActivation&&navigator.userActivation.isActive)openPip(true)});
-}
-/* ---------- التحكم بالمايك من برا الموقع (إشعارات / سماعة / مفتاح Play-Pause) ---------- */
-var extEl=null,extLast=0,extKey='';
-function extWav(){
- var sr=8000,n=sr*10,b=new Uint8Array(44+n),d=new DataView(b.buffer);
- function w(o,t){for(var i=0;i<t.length;i++)b[o+i]=t.charCodeAt(i)}
- w(0,'RIFF');d.setUint32(4,36+n,true);w(8,'WAVE');w(12,'fmt ');d.setUint32(16,16,true);d.setUint16(20,1,true);d.setUint16(22,1,true);
- d.setUint32(24,sr,true);d.setUint32(28,sr,true);d.setUint16(32,1,true);d.setUint16(34,8,true);w(36,'data');d.setUint32(40,n,true);b.fill(128,44);
- return URL.createObjectURL(new Blob([b],{type:'audio/wav'}));
-}
-function extToggle(){var n=Date.now();if(n-extLast<400)return;extLast=n;ptt(!pttOn);extPaint(true)}
-function extStart(){
- if(!extEl){
-  extEl=document.createElement('audio');extEl.src=extWav();extEl.loop=true;extEl.setAttribute('playsinline','');extEl.style.display='none';document.body.appendChild(extEl);
-  extEl.addEventListener('pause',function(){setTimeout(function(){if(extEl&&extEl.paused)extEl.play().catch(function(){})},300)});
- }
- extEl.play().catch(function(){});
-}
-function extStop(){
- try{var ms=navigator.mediaSession;['play','pause','togglemicrophone'].forEach(function(a){try{ms.setActionHandler(a,null)}catch(x){}});ms.metadata=null;ms.playbackState='none'}catch(x){}
- if(extEl){var el=extEl;extEl=null;try{el.pause();el.removeAttribute('src');el.load();el.remove()}catch(x){}}
-}
-function extSetup(){
- var ms=navigator.mediaSession;if(!ms)return;
- ['play','pause','togglemicrophone'].forEach(function(a){try{ms.setActionHandler(a,extToggle)}catch(x){}});
- extPaint(true);
-}
-function extPaint(force){
- var k=pttOn?'1':'0';if(!force&&k===extKey)return;extKey=k;
- try{var ms=navigator.mediaSession;ms.playbackState=pttOn?'playing':'paused';
-  ms.metadata=new MediaMetadata({title:pttOn?'🟢 المايك شغال':'🔇 المايك مقفل',artist:'تردد القطاعات — اضغط تشغيل/إيقاف'});
-  if(ms.setMicrophoneActive)ms.setMicrophoneActive(pttOn)}catch(x){}
-}
-/* ---------- الواجهة ---------- */
-function paint(){
- if(!S)return;var me=who(ME.uid);
- $('cnt').textContent='👥 '+S.people.length+' داخل الروم'+(S.rec?' · 🔴 الروم مسجّل':'');
- $('m-open').classList.toggle('on',S.mode==='open');$('m-mute').classList.toggle('on',S.mode==='mute');
- $('note').textContent=S.mode==='open'?'الكل يتكلم ويسمع. اضغط واستمر على زر المايك للتحدث.':'الروم صامت، محد يتكلم.';
- $('grid').innerHTML=S.people.map(function(p){var self=p.uid===ME.uid;
-  return '<div class="tile'+''+(speaking[p.uid]?' speaking':'')+'" id="t-'+p.uid+'" onclick="pick(\''+p.uid+'\')"><div class="av">'+esc(p.name.charAt(0))+'</div><div class="nm">'+esc(p.name)+(self?' (أنت)':'')+'</div><div class="rl">⭐ كبير</div><div class="ic">'+(p.muted?'🔇':'🎙️')+'</div>'
-  +'<button class="btn sm gray" onclick="event.stopPropagation();mute(\''+p.uid+'\','+!p.muted+')">'+(p.muted?'🔊 فك الكتم':'🔇 كتم')+'</button>'
-  +(self?'':'<button class="btn sm red" onclick="event.stopPropagation();kick(\''+p.uid+'\')">🚪 طرد</button>')+'</div>'}).join('');
- applyMute();pttPaint();
-}
-function setMode(m){api('/api/mode',{mode:m}).catch(function(e){toast(e.message)})}
-function mute(t,on){api('/api/mute',{target:t,on:on}).catch(function(e){toast(e.message)})}
-function kick(t){if(confirm('تطرد هذا الشخص؟'))api('/api/kick',{target:t}).catch(function(e){toast(e.message)})}
-/* كشف الكلام */
-function watch(uid,st){try{var a=ac.createAnalyser();a.fftSize=256;ac.createMediaStreamSource(st).connect(a);an[uid]={a:a,b:new Uint8Array(a.fftSize)}}catch(e){}}
-function level(){Object.keys(an).forEach(function(u){var o=an[u];o.a.getByteTimeDomainData(o.b);var s=0;for(var i=0;i<o.b.length;i++){var v=(o.b[i]-128)/128;s+=v*v}var on=Math.sqrt(s/o.b.length)>0.03;if(on!==!!speaking[u]){speaking[u]=on;var t=$('t-'+u);if(t)t.classList.toggle('speaking',on)}})}
-/* الشات */
-function addChat(m){var d=document.createElement('div');d.innerHTML='<b style="color:var(--gold-soft)">'+esc(m.name)+':</b> '+esc(m.text).replace(/(https?:\/\/[^\s]+)/g,'<a href="$1" target="_blank" style="color:#93c5fd">$1</a>');$('cl').appendChild(d);$('cl').scrollTop=1e9}
-function chatToggle(){var s=$('sheet');s.classList.toggle('open');if(s.classList.contains('open')){unread=0;$('cd').innerHTML=''}}
-function chatSend(){var i=$('ci'),t=i.value.trim();if(!t)return;i.value='';api('/api/chat',{text:t}).catch(function(e){toast(e.message)})}
-/* تسجيل الروم (يبدأ تلقائي لما يكون فيه شخصين فأكثر) */
-function recMime(){var c=['audio/webm;codecs=opus','audio/webm','audio/mp4'];for(var i=0;i<c.length;i++){try{if(MediaRecorder.isTypeSupported(c[i]))return c[i]}catch(e){}}return''}
-function recCheck(){
- if(!window.MediaRecorder)return;
- if(rec){if(S.people.length<2)recStop();return}
- if(S.people.length<2||S.rec||recBusy)return;recBusy=true;
- api('/api/rec/start',{mime:recMime()}).then(function(r){recBusy=false;if(!r.ok)return;
-  var mr=new MediaRecorder(rdest.stream,recMime()?{mimeType:recMime()}:{}),q=Promise.resolve();rec={mr:mr,sid:r.sid};
-  mr.ondataavailable=function(e){if(!e.data.size)return;q=q.then(function(){return fetch('/api/rec/chunk?uid='+ME.uid+'&sid='+encodeURIComponent(r.sid),{method:'POST',body:e.data})}).catch(function(){})};
-  mr.start(4000)}).catch(function(){recBusy=false});
-}
-function recStop(){if(!rec)return;var r=rec;rec=null;try{r.mr.stop()}catch(e){}setTimeout(function(){api('/api/rec/stop',{}).catch(function(){})},1500)}
-function showRecs(){
- $('recs').style.display='flex';$('rl').textContent='...';
- fetch('/api/rec').then(function(r){return r.json()}).then(function(l){$('rl').innerHTML=l.length?l.map(function(x){return '<div>🕒 '+new Date(x.at).toLocaleString('ar-SA')+' — '+x.kb+' ك.ب<audio controls preload="none" src="/api/rec/'+encodeURIComponent(x.f)+'"></audio></div>'}).join(''):'ما فيه تسجيلات للحين.'});
-}
-function leave(k){
- recStop();if(ev)ev.close();Object.keys(P).forEach(function(u){P[u].pc.close()});
- if(!k&&ME)navigator.sendBeacon('/api/leave',new Blob([JSON.stringify({uid:ME.uid})],{type:'application/json'}));
- try{stream.getTracks().forEach(function(t){t.stop()})}catch(e){}
- if(pipWin)try{pipWin.close()}catch(e){}try{if(document.pictureInPictureElement)document.exitPictureInPicture()}catch(e){}pipClean();pipKill();extStop();
- setTimeout(function(){location.reload()},300);
-}
-window.addEventListener('pagehide',function(){if(ME&&!ME.left&&false)leave()});
-</script></body></html>`;
+
+app.post("/api/send", async (req, res) => {
+    if (limited(req.ip)) return res.status(429).json({ error: "بطّئ شوي، كثرت الطلبات" });
+    const b = req.body || {};
+    const payload = JSON.stringify({
+        title: String(b.title || "فلاش").slice(0, 60),
+        body: String(b.body || "").slice(0, 160),
+        url: "/",
+    });
+    const targets = b.all ? [...devices.values()].filter(d => d.sub) : [devices.get(b.id)].filter(d => d && d.sub);
+    if (!targets.length) return res.status(404).json({ error: "هذا الجهاز ما فعّل الإشعارات" });
+
+    const failed = []; let sent = 0;
+    await Promise.all(targets.map(async d => {
+        try {
+            await webpush.sendNotification(d.sub, payload, { TTL: 120, urgency: "high" });
+            sent++;
+        } catch (e) {
+            failed.push({ id: d.id, name: d.name, code: e.statusCode || 0 });
+            if (e.statusCode === 404 || e.statusCode === 410) { d.sub = null; saveSoon(); }
+            else console.log("❌ push:", d.name, e.statusCode || "", e.body || e.message);
+        }
+    }));
+    if (failed.length) broadcast();
+    res.json({ sent, failed });
+});
+
+app.listen(PORT, () => console.log("⚡ فلاش | تجربة الإشعارات شغالة على المنفذ " + PORT));
