@@ -15,7 +15,7 @@ const CONFIG = {
     PORT: process.env.PORT || 3000,
     SITE_NAME: "فلاش",
     TITLE: "تردد القطاعات المشتركة",
-    FREQUENCY: process.env.FREQUENCY || "123.45",
+    FREQUENCY: process.env.FREQUENCY || "000.00",
     MAX_USERS: 25,
 };
 
@@ -140,6 +140,7 @@ const PAGE = `<!DOCTYPE html>
     <div id="audio" style="display:none"></div>
     <div class="bar">
         <button class="ov-btn" id="mic-btn">🎙️ المايك</button>
+        <button class="ov-btn" id="pip-btn" style="display:none">🪟 نافذة عائمة</button>
         <button class="ov-btn leave" id="leave-btn">📞 خروج</button>
     </div>
 </div>
@@ -171,19 +172,80 @@ const PAGE = `<!DOCTYPE html>
         $('nm-overlay').classList.remove('open');
         join(n);
     }
-    $('mic-btn').onclick = function () {
+    // ---------- التحكم بالمايك (من الموقع ومن خارجه) ----------
+    var SWREG = null, PIP = null;
+    function micOn() { var t = S && S.stream.getAudioTracks()[0]; return !!(t && t.enabled); }
+    function applyMicUi() {
+        var on = micOn();
+        var b = $('mic-btn'); b.classList.toggle('off', !on); b.textContent = on ? '🎙️ المايك' : '🔇 مكتوم';
+        if (PIP) { var pb = PIP.document.getElementById('pm'); if (pb) { pb.textContent = on ? '🎙️ المايك' : '🔇 مكتوم'; pb.style.background = on ? 'rgba(255,255,255,0.12)' : '#7f1d1d'; } }
+        try { if (navigator.mediaSession && navigator.mediaSession.setMicrophoneActive) navigator.mediaSession.setMicrophoneActive(on); } catch (e) {}
+        showNotif();
+    }
+    function toggleMic() {
         if (!S) return;
         var t = S.stream.getAudioTracks()[0]; if (!t) return;
         t.enabled = !t.enabled;
-        this.classList.toggle('off', !t.enabled);
-        this.textContent = t.enabled ? '🎙️ المايك' : '🔇 مكتوم';
-    };
+        applyMicUi();
+    }
+    // إشعار ثابت فيه أزرار (كتم / خروج) يظهر وانت برا الموقع — أندرويد وكروم سطح المكتب
+    function showNotif() {
+        if (!S || !SWREG || !('Notification' in window) || Notification.permission !== 'granted') return;
+        var on = micOn();
+        try {
+            SWREG.showNotification('📻 ' + FREQ + ' — أنت داخل التردد', {
+                body: on ? '🎙️ المايك شغال' : '🔇 المايك مكتوم',
+                tag: 'fq-live', renotify: false, requireInteraction: true, silent: true,
+                actions: [{ action: 'mute', title: on ? '🔇 كتم المايك' : '🎙️ فتح المايك' }, { action: 'leave', title: '📞 خروج' }]
+            });
+        } catch (e) {}
+    }
+    function clearNotif() {
+        try { if (SWREG) SWREG.getNotifications({ tag: 'fq-live' }).then(function (l) { l.forEach(function (n) { n.close(); }); }); } catch (e) {}
+    }
+    function setupBackground() {
+        try { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission(); } catch (e) {}
+        try {
+            if (navigator.mediaSession) {
+                navigator.mediaSession.metadata = new MediaMetadata({ title: 'تردد القطاعات المشتركة', artist: FREQ });
+                navigator.mediaSession.setActionHandler('togglemicrophone', function () { toggleMic(); });
+                navigator.mediaSession.setActionHandler('hangup', function () { leave(); });
+            }
+        } catch (e) {}
+    }
+    if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('/sw.js').then(function (r) { SWREG = r; }).catch(function () {});
+        navigator.serviceWorker.addEventListener('message', function (e) {
+            if (!e.data) return;
+            if (e.data.act === 'mute') toggleMic();
+            else if (e.data.act === 'leave') leave();
+        });
+    }
+    // نافذة عائمة فوق كل البرامج (كروم سطح المكتب)
+    async function openPip() {
+        if (!window.documentPictureInPicture || PIP || !S) return;
+        try {
+            var w = await window.documentPictureInPicture.requestWindow({ width: 260, height: 90 });
+            PIP = w;
+            w.document.body.style.cssText = 'margin:0;display:flex;gap:8px;align-items:center;justify-content:center;height:100vh;background:#0a1628;font-family:Tahoma,sans-serif;direction:rtl';
+            var mk = function (id, txt, bg, fn) { var b = w.document.createElement('button'); b.id = id; b.textContent = txt;
+                b.style.cssText = 'padding:10px 14px;border-radius:24px;border:1px solid #3b82f6;color:#fff;font-weight:700;font-size:14px;cursor:pointer;background:' + bg; b.onclick = fn; w.document.body.appendChild(b); };
+            mk('pm', '🎙️ المايك', 'rgba(255,255,255,0.12)', toggleMic);
+            mk('pl', '📞 خروج', '#ef4444', function () { leave(); });
+            w.addEventListener('pagehide', function () { PIP = null; });
+            applyMicUi();
+        } catch (e) { PIP = null; }
+    }
+    if (window.documentPictureInPicture) $('pip-btn').style.display = '';
+    $('pip-btn').onclick = openPip;
+    $('mic-btn').onclick = toggleMic;
     $('leave-btn').onclick = function () { leave(); };
     $('nm-ok').onclick = submitName;
     $('nm-input').onkeydown = function (e) { if (e.key === 'Enter') submitName(); };
 
     async function join(name) {
         if (S) return;
+        setupBackground();
         if (!window.RTCPeerConnection || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
             toast('متصفحك لا يدعم الصوت، استخدم Chrome أو Safari حديث'); return;
         }
@@ -210,6 +272,9 @@ const PAGE = `<!DOCTYPE html>
         try { s.ws.close(); } catch (e) {}
         try { if (s.ac) s.ac.close(); } catch (e) {}
         clearInterval(s.timer);
+        clearNotif();
+        try { if (PIP) PIP.close(); } catch (e) {} PIP = null;
+        try { if (navigator.mediaSession) { navigator.mediaSession.setActionHandler('togglemicrophone', null); navigator.mediaSession.setActionHandler('hangup', null); } } catch (e) {}
         $('room').classList.remove('open');
         document.body.style.overflow = '';
         $('enter-btn').disabled = false;
@@ -233,6 +298,7 @@ const PAGE = `<!DOCTYPE html>
             (d.peers || []).forEach(function (p) { var P = makePeer(p.id); startOffer(P); });
             S.timer = setInterval(paintSpeaking, 150);
             paint();
+            applyMicUi();
         } else if (d.t === 'joined') {
             S.users[d.id] = { name: d.name }; paint();
         } else if (d.t === 'left') {
@@ -364,7 +430,22 @@ const html = PAGE
     .replace(/__SITE__/g, CONFIG.SITE_NAME)
     .replace(/__FREQ__/g, String(CONFIG.FREQUENCY).replace(/[<>&"']/g, ""));
 app.get("/", (req, res) => { res.set("Cache-Control", "no-store").type("html").send(html); });
-app.get("/health", (req, res) => res.json({ ok: true }));
+const SW_JS = `
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
+self.addEventListener('notificationclick', (e) => {
+    const act = e.action || '';
+    if (act === 'leave') e.notification.close();
+    e.waitUntil((async () => {
+        const list = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+        if (act === 'mute' || act === 'leave') { list.forEach(c => c.postMessage({ act })); }
+        else if (list[0]) { await list[0].focus(); }
+        else { await self.clients.openWindow('/'); }
+    })());
+});
+`;
+app.get("/sw.js", (req, res) => { res.set("Cache-Control", "no-store").type("application/javascript").send(SW_JS); });
+app.get("/health",(req, res) => res.json({ ok: true }));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws", maxPayload: 64 * 1024 });
