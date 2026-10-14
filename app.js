@@ -15,7 +15,7 @@ const CONFIG = {
     PORT: process.env.PORT || 3000,
     SITE_NAME: "فلاش",
     TITLE: "تردد القطاعات المشتركة",
-    FREQUENCY: process.env.FREQUENCY || "000.00",
+    FREQUENCY: process.env.FREQUENCY || "123.45",
     MAX_USERS: 25,
 };
 
@@ -96,6 +96,12 @@ const PAGE = `<!DOCTYPE html>
     .av { width: 56px; height: 56px; border-radius: 50%; margin: 0 auto 8px; background: linear-gradient(135deg, #1d4ed8, #60a5fa); display: flex; align-items: center; justify-content: center; font-size: 24px; font-weight: 800; color: #fff; }
     .nm { font-size: 13px; font-weight: 700; word-break: break-word; }
     .me { font-size: 11px; color: var(--gold-soft); margin-top: 3px; }
+    #room { padding-bottom: 100px; }
+    .bar { position: fixed; bottom: 0; left: 0; right: 0; z-index: 4100; display: flex; justify-content: center; gap: 12px; padding: 14px; background: rgba(5,15,30,0.95); border-top: 1px solid rgba(59,130,246,0.3); }
+    .ov-btn { min-width: 130px; padding: 13px 18px; border-radius: 30px; border: 1px solid var(--border); background: rgba(255,255,255,0.08); color: #fff; font-family: inherit; font-size: 15px; font-weight: 700; cursor: pointer; }
+    .ov-btn.off { background: #7f1d1d; border-color: #ef4444; }
+    .ov-btn.leave { background: #ef4444; border-color: #ef4444; }
+    .ov-btn:active { transform: scale(0.97); }
     #toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%); background: #0b1730; border: 1px solid var(--border); color: var(--text); padding: 10px 18px; border-radius: 10px; font-size: 14px; z-index: 9000; display: none; max-width: 90vw; text-align: center; }
 </style>
 </head>
@@ -132,6 +138,10 @@ const PAGE = `<!DOCTYPE html>
     </div>
     <div id="grid" class="grid"></div>
     <div id="audio" style="display:none"></div>
+    <div class="bar">
+        <button class="ov-btn" id="mic-btn">🎙️ المايك</button>
+        <button class="ov-btn leave" id="leave-btn">📞 خروج</button>
+    </div>
 </div>
 <div id="toast"></div>
 
@@ -161,6 +171,14 @@ const PAGE = `<!DOCTYPE html>
         $('nm-overlay').classList.remove('open');
         join(n);
     }
+    $('mic-btn').onclick = function () {
+        if (!S) return;
+        var t = S.stream.getAudioTracks()[0]; if (!t) return;
+        t.enabled = !t.enabled;
+        this.classList.toggle('off', !t.enabled);
+        this.textContent = t.enabled ? '🎙️ المايك' : '🔇 مكتوم';
+    };
+    $('leave-btn').onclick = function () { leave(); };
     $('nm-ok').onclick = submitName;
     $('nm-input').onkeydown = function (e) { if (e.key === 'Enter') submitName(); };
 
@@ -195,6 +213,7 @@ const PAGE = `<!DOCTYPE html>
         $('room').classList.remove('open');
         document.body.style.overflow = '';
         $('enter-btn').disabled = false;
+        $('mic-btn').classList.remove('off'); $('mic-btn').textContent = '🎙️ المايك';
         if (msg) toast(msg);
     }
 
