@@ -38,6 +38,13 @@ const PAGE = `<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0a1628">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" type="image/png" href="/icon-192.png">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="__SITE__">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
 <title>__TITLE__ — __SITE__</title>
 <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
 <style>
@@ -175,8 +182,33 @@ const PAGE = `<!DOCTYPE html>
     // ---------- التحكم بالمايك (من الموقع ومن خارجه) ----------
     var SWREG = null, PIP = null;
     function micOn() { var t = S && S.stream.getAudioTracks()[0]; return !!(t && t.enabled); }
+    function setMic(on) {
+        if (!S) return;
+        var t = S.stream.getAudioTracks()[0]; if (!t) return;
+        t.enabled = !!on; applyMicUi();
+    }
+    // صوت صامت يشتغل بالخلفية: يخلي الأيفون يعتبر الموقع "مشغّل صوت" فتظهر أزرار القفل/مركز التحكم
+    function silentWavUrl() {
+        var rate = 8000, n = rate, buf = new ArrayBuffer(44 + n), v = new DataView(buf);
+        function str(o, s) { for (var i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); }
+        str(0, 'RIFF'); v.setUint32(4, 36 + n, true); str(8, 'WAVE'); str(12, 'fmt '); v.setUint32(16, 16, true);
+        v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, rate, true); v.setUint32(28, rate, true);
+        v.setUint16(32, 1, true); v.setUint16(34, 8, true); str(36, 'data'); v.setUint32(40, n, true);
+        for (var i = 0; i < n; i++) v.setUint8(44 + i, 128);
+        return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+    }
+    var KEEP = null;
+    function startKeepAlive() {   // لازم يُستدعى مباشرة من ضغطة المستخدم (شرط iOS)
+        if (KEEP) return;
+        try {
+            var a = new Audio(silentWavUrl()); a.loop = true; a.volume = 0.01; a.setAttribute('playsinline', '');
+            KEEP = a; var p = a.play(); if (p && p.catch) p.catch(function () {});
+        } catch (e) {}
+    }
+    function stopKeepAlive() { try { if (KEEP) { KEEP.pause(); KEEP.src = ''; } } catch (e) {} KEEP = null; }
     function applyMicUi() {
         var on = micOn();
+        try { if (navigator.mediaSession) navigator.mediaSession.playbackState = on ? 'playing' : 'paused'; } catch (e) {}
         var b = $('mic-btn'); b.classList.toggle('off', !on); b.textContent = on ? '🎙️ المايك' : '🔇 مكتوم';
         if (PIP) { var pb = PIP.document.getElementById('pm'); if (pb) { pb.textContent = on ? '🎙️ المايك' : '🔇 مكتوم'; pb.style.background = on ? 'rgba(255,255,255,0.12)' : '#7f1d1d'; } }
         try { if (navigator.mediaSession && navigator.mediaSession.setMicrophoneActive) navigator.mediaSession.setMicrophoneActive(on); } catch (e) {}
@@ -210,6 +242,10 @@ const PAGE = `<!DOCTYPE html>
                 navigator.mediaSession.metadata = new MediaMetadata({ title: 'تردد القطاعات المشتركة', artist: FREQ });
                 navigator.mediaSession.setActionHandler('togglemicrophone', function () { toggleMic(); });
                 navigator.mediaSession.setActionHandler('hangup', function () { leave(); });
+                // أيفون/أندرويد: زر ⏸ في شاشة القفل ومركز التحكم = كتم المايك، و ▶ = فتحه
+                navigator.mediaSession.setActionHandler('pause', function () { setMic(false); });
+                navigator.mediaSession.setActionHandler('play', function () { setMic(true); });
+                navigator.mediaSession.setActionHandler('stop', function () { leave(); });
             }
         } catch (e) {}
     }
@@ -246,6 +282,7 @@ const PAGE = `<!DOCTYPE html>
     async function join(name) {
         if (S) return;
         setupBackground();
+        startKeepAlive();
         if (!window.RTCPeerConnection || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
             toast('متصفحك لا يدعم الصوت، استخدم Chrome أو Safari حديث'); return;
         }
@@ -253,7 +290,7 @@ const PAGE = `<!DOCTYPE html>
         var stream;
         try {
             stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false });
-        } catch (e) { btn.disabled = false; toast('تعذر تشغيل المايك — اسمح للموقع باستخدام المايك'); return; }
+        } catch (e) { btn.disabled = false; stopKeepAlive(); toast('تعذر تشغيل المايك — اسمح للموقع باستخدام المايك'); return; }
 
         var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
         var ws = new WebSocket(proto + location.host + '/ws');
@@ -274,7 +311,8 @@ const PAGE = `<!DOCTYPE html>
         clearInterval(s.timer);
         clearNotif();
         try { if (PIP) PIP.close(); } catch (e) {} PIP = null;
-        try { if (navigator.mediaSession) { navigator.mediaSession.setActionHandler('togglemicrophone', null); navigator.mediaSession.setActionHandler('hangup', null); } } catch (e) {}
+        stopKeepAlive();
+        try { if (navigator.mediaSession) { ['togglemicrophone', 'hangup', 'pause', 'play', 'stop'].forEach(function (a) { try { navigator.mediaSession.setActionHandler(a, null); } catch (e) {} }); navigator.mediaSession.metadata = null; } } catch (e) {}
         $('room').classList.remove('open');
         document.body.style.overflow = '';
         $('enter-btn').disabled = false;
@@ -433,6 +471,7 @@ app.get("/", (req, res) => { res.set("Cache-Control", "no-store").type("html").s
 const SW_JS = `
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
+self.addEventListener('fetch', (e) => { if (e.request.method === 'GET' && e.request.mode === 'navigate') e.respondWith(fetch(e.request).catch(() => new Response('<meta charset=utf-8><body style="background:#0a1628;color:#e2e8f0;font-family:sans-serif;text-align:center;padding-top:40vh">لا يوجد اتصال بالإنترنت', { headers: { 'Content-Type': 'text/html; charset=utf-8' } }))); });
 self.addEventListener('notificationclick', (e) => {
     const act = e.action || '';
     if (act === 'leave') e.notification.close();
@@ -445,6 +484,48 @@ self.addEventListener('notificationclick', (e) => {
 });
 `;
 app.get("/sw.js", (req, res) => { res.set("Cache-Control", "no-store").type("application/javascript").send(SW_JS); });
+
+// ---------------- PWA: أيقونات + manifest ----------------
+const zlib = require("zlib");
+const CRC_T = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(buf) { let c = 0xffffffff; for (let i = 0; i < buf.length; i++) c = CRC_T[(c ^ buf[i]) & 255] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
+function pngChunk(type, data) {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+    const td = Buffer.concat([Buffer.from(type), data]);
+    const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(td));
+    return Buffer.concat([len, td, crc]);
+}
+function makeIcon(size) {
+    const raw = Buffer.alloc((size * 4 + 1) * size);
+    const c = size / 2;
+    for (let y = 0; y < size; y++) {
+        raw[y * (size * 4 + 1)] = 0;
+        for (let x = 0; x < size; x++) {
+            const dx = x + 0.5 - c, dy = y + 0.5 - c, d = Math.sqrt(dx * dx + dy * dy) / size;
+            const t = Math.min(1, d * 1.6);
+            let r = 18 - 8 * t, g = 48 - 26 * t, b = 94 - 54 * t;           // خلفية زرقاء داكنة
+            if (d < 0.34) { const k = (dx + dy) / size + 0.5; r = 29 + (96 - 29) * k; g = 78 + (165 - 78) * k; b = 216 + (250 - 216) * k; } // دائرة زرقاء
+            if (d > 0.19 && d < 0.235) { r = g = b = 255; }               // حلقة بيضاء
+            if (d < 0.07) { r = g = b = 255; }                            // نقطة المركز
+            const o = y * (size * 4 + 1) + 1 + x * 4;
+            raw[o] = r; raw[o + 1] = g; raw[o + 2] = b; raw[o + 3] = 255;
+        }
+    }
+    const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(size, 0); ihdr.writeUInt32BE(size, 4); ihdr[8] = 8; ihdr[9] = 6;
+    return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), pngChunk("IHDR", ihdr), pngChunk("IDAT", zlib.deflateSync(raw)), pngChunk("IEND", Buffer.alloc(0))]);
+}
+const ICONS = { 180: makeIcon(180), 192: makeIcon(192), 512: makeIcon(512) };
+[180, 192, 512].forEach(sz => app.get("/icon-" + sz + ".png", (req, res) => { res.set("Cache-Control", "public, max-age=86400").type("image/png").send(ICONS[sz]); }));
+app.get("/manifest.json", (req, res) => {
+    res.type("application/manifest+json").send(JSON.stringify({
+        name: CONFIG.TITLE + " — " + CONFIG.SITE_NAME, short_name: CONFIG.SITE_NAME, lang: "ar", dir: "rtl",
+        start_url: "/", scope: "/", display: "standalone", background_color: "#0a1628", theme_color: "#0a1628",
+        icons: [
+            { src: "/icon-192.png", sizes: "192x192", type: "image/png", purpose: "any maskable" },
+            { src: "/icon-512.png", sizes: "512x512", type: "image/png", purpose: "any maskable" },
+        ],
+    }));
+});
 app.get("/health",(req, res) => res.json({ ok: true }));
 
 const server = http.createServer(app);
