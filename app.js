@@ -103,9 +103,16 @@ const PAGE = `<!DOCTYPE html>
     .av { width: 56px; height: 56px; border-radius: 50%; margin: 0 auto 8px; background: linear-gradient(135deg, #1d4ed8, #60a5fa); display: flex; align-items: center; justify-content: center; font-size: 24px; font-weight: 800; color: #fff; }
     .nm { font-size: 13px; font-weight: 700; word-break: break-word; }
     .me { font-size: 11px; color: var(--gold-soft); margin-top: 3px; }
-    #room { padding-bottom: 100px; }
+    #room { padding-bottom: 100px; padding-top: 78px; }
+    #fab { position: fixed; top: calc(env(safe-area-inset-top, 0px) + 10px); left: 10px; z-index: 4200; display: none; align-items: center; gap: 8px; touch-action: none; user-select: none; -webkit-user-select: none; }
+    #fab-btn { width: 56px; height: 56px; border-radius: 50%; border: 2px solid #60a5fa; background: linear-gradient(135deg, #1d4ed8, #3b82f6); color: #fff; font-size: 24px; cursor: grab; box-shadow: 0 4px 16px rgba(0,0,0,0.5); touch-action: none; transition: background .15s, border-color .15s, box-shadow .15s; }
+    #fab.live #fab-btn { border-color: #22c55e; box-shadow: 0 0 16px rgba(34,197,94,0.6); }
+    #fab.off #fab-btn { background: #7f1d1d; border-color: #ef4444; }
+    #fab.warn #fab-btn { background: #854d0e; border-color: #eab308; }
+    #fab-st { background: rgba(5,15,30,0.92); border: 1px solid var(--border); border-radius: 20px; padding: 6px 12px; font-size: 13px; font-weight: 700; white-space: nowrap; }
+    #fab.live #fab-st { color: #86efac; } #fab.off #fab-st { color: #fca5a5; } #fab.warn #fab-st { color: #fde68a; }
     .bar { position: fixed; bottom: 0; left: 0; right: 0; z-index: 4100; display: flex; justify-content: center; gap: 12px; padding: 14px; background: rgba(5,15,30,0.95); border-top: 1px solid rgba(59,130,246,0.3); }
-    .ov-btn { min-width: 130px; padding: 13px 18px; border-radius: 30px; border: 1px solid var(--border); background: rgba(255,255,255,0.08); color: #fff; font-family: inherit; font-size: 15px; font-weight: 700; cursor: pointer; }
+    .ov-btn { flex: 1 1 0; max-width: 170px; min-width: 0; padding: 13px 10px; white-space: nowrap; border-radius: 30px; border: 1px solid var(--border); background: rgba(255,255,255,0.08); color: #fff; font-family: inherit; font-size: 15px; font-weight: 700; cursor: pointer; }
     .ov-btn.off { background: #7f1d1d; border-color: #ef4444; }
     .ov-btn.leave { background: #ef4444; border-color: #ef4444; }
     .ov-btn:active { transform: scale(0.97); }
@@ -151,6 +158,7 @@ const PAGE = `<!DOCTYPE html>
         <button class="ov-btn leave" id="leave-btn">📞 خروج</button>
     </div>
 </div>
+<div id="fab"><button id="fab-btn" aria-label="المايك">🎙️</button><span id="fab-st"></span></div>
 <div id="toast"></div>
 
 <script>
@@ -202,24 +210,65 @@ const PAGE = `<!DOCTYPE html>
         if (KEEP) return;
         try {
             var a = new Audio(silentWavUrl()); a.loop = true; a.volume = 0.01; a.setAttribute('playsinline', '');
+            // زر ⏸/▶ في شاشة القفل يوقف/يشغّل هذا الصوت → نربطه بالمايك مباشرة
+            a.onpause = function () { if (S && micOn()) setMic(false); };
+            a.onplay = function () { if (S && !micOn()) setMic(true); };
             KEEP = a; var p = a.play(); if (p && p.catch) p.catch(function () {});
         } catch (e) {}
     }
-    function stopKeepAlive() { try { if (KEEP) { KEEP.pause(); KEEP.src = ''; } } catch (e) {} KEEP = null; }
+    function stopKeepAlive() { try { if (KEEP) { KEEP.onpause = KEEP.onplay = null; KEEP.pause(); KEEP.src = ''; } } catch (e) {} KEEP = null; }
     function applyMicUi() {
         var on = micOn();
         try { if (navigator.mediaSession) navigator.mediaSession.playbackState = on ? 'playing' : 'paused'; } catch (e) {}
+        try { if (KEEP) { if (on && KEEP.paused) { var pp = KEEP.play(); if (pp && pp.catch) pp.catch(function () {}); } else if (!on && !KEEP.paused) KEEP.pause(); } } catch (e) {}
         var b = $('mic-btn'); b.classList.toggle('off', !on); b.textContent = on ? '🎙️ المايك' : '🔇 مكتوم';
         if (PIP) { var pb = PIP.document.getElementById('pm'); if (pb) { pb.textContent = on ? '🎙️ المايك' : '🔇 مكتوم'; pb.style.background = on ? 'rgba(255,255,255,0.12)' : '#7f1d1d'; } }
         try { if (navigator.mediaSession && navigator.mediaSession.setMicrophoneActive) navigator.mediaSession.setMicrophoneActive(on); } catch (e) {}
         showNotif();
+        paintStatus();
     }
-    function toggleMic() {
-        if (!S) return;
-        var t = S.stream.getAudioTracks()[0]; if (!t) return;
-        t.enabled = !t.enabled;
-        applyMicUi();
+    function toggleMic() { if (S) setMic(!micOn()); }
+    // ---------- زر المايك العائم (يتحرك بالسحب) + حالة المايك ----------
+    function paintStatus() {
+        var f = $('fab');
+        if (!S || !$('room').classList.contains('open')) { f.style.display = 'none'; return; }
+        f.style.display = 'flex';
+        var tr = S.stream.getAudioTracks()[0], cls, ic, txt;
+        if (!tr || tr.readyState !== 'live') { cls = 'warn'; ic = '⚠️'; txt = 'المايك توقف — اضغط'; }
+        else if (!S.ws || S.ws.readyState !== 1 || !S.id) { cls = 'warn'; ic = '⏳'; txt = 'يعيد الاتصال…'; }
+        else if (!tr.enabled) { cls = 'off'; ic = '🔇'; txt = 'مكتوم'; }
+        else { cls = 'live'; ic = '🎙️'; txt = 'المايك شغال'; }
+        f.className = cls; $('fab-btn').textContent = ic; $('fab-st').textContent = txt;
     }
+    (function fabDrag() {
+        var f = $('fab'), b = $('fab-btn'), sx, sy, ox, oy, moved = false, down = false;
+        try { var sv = JSON.parse(localStorage.getItem('fq_fab') || 'null'); if (sv) { f.style.left = sv.x + 'px'; f.style.top = sv.y + 'px'; } } catch (e) {}
+        b.addEventListener('pointerdown', function (e) {
+            down = true; moved = false; sx = e.clientX; sy = e.clientY;
+            var r = f.getBoundingClientRect(); ox = r.left; oy = r.top;
+            try { b.setPointerCapture(e.pointerId); } catch (x) {}
+        });
+        b.addEventListener('pointermove', function (e) {
+            if (!down) return;
+            var dx = e.clientX - sx, dy = e.clientY - sy;
+            if (!moved && Math.abs(dx) + Math.abs(dy) < 8) return;
+            moved = true;
+            var x = Math.max(4, Math.min(window.innerWidth - 64, ox + dx)), y = Math.max(4, Math.min(window.innerHeight - 64, oy + dy));
+            f.style.left = x + 'px'; f.style.top = y + 'px';
+        });
+        function end() {
+            if (!down) return; down = false;
+            if (moved) { try { localStorage.setItem('fq_fab', JSON.stringify({ x: parseInt(f.style.left, 10), y: parseInt(f.style.top, 10) })); } catch (e) {} return; }
+            var tr = S && S.stream.getAudioTracks()[0];
+            if (tr && tr.readyState !== 'live') ensureMic(); else toggleMic();
+            paintStatus();
+        }
+        b.addEventListener('pointerup', end);
+        b.addEventListener('pointercancel', function () { down = false; });
+        b.addEventListener('click', function (e) { e.stopPropagation(); });
+        f.addEventListener('click', function (e) { e.stopPropagation(); });
+    })();
+    setInterval(paintStatus, 800);
     // إشعار ثابت فيه أزرار (كتم / خروج) يظهر وانت برا الموقع — أندرويد وكروم سطح المكتب
     function showNotif() {
         if (!S || !SWREG || !('Notification' in window) || Notification.permission !== 'granted') return;
@@ -279,34 +328,88 @@ const PAGE = `<!DOCTYPE html>
     $('nm-ok').onclick = submitName;
     $('nm-input').onkeydown = function (e) { if (e.key === 'Enter') submitName(); };
 
+    function getMic() {
+        return navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false })
+            .catch(function () { return null; });
+    }
     async function join(name) {
         if (S) return;
         setupBackground();
         startKeepAlive();
         if (!window.RTCPeerConnection || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-            toast('متصفحك لا يدعم الصوت، استخدم Chrome أو Safari حديث'); return;
+            stopKeepAlive(); toast('متصفحك لا يدعم الصوت، استخدم Chrome أو Safari حديث'); return;
         }
         var btn = $('enter-btn'); btn.disabled = true;
-        var stream;
-        try {
-            stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false });
-        } catch (e) { btn.disabled = false; stopKeepAlive(); toast('تعذر تشغيل المايك — اسمح للموقع باستخدام المايك'); return; }
-
+        var stream = await getMic();
+        if (!stream) { btn.disabled = false; stopKeepAlive(); toast('تعذر تشغيل المايك — اسمح للموقع باستخدام المايك'); return; }
+        S = { ws: null, stream: stream, id: null, name: name, ice: [], peers: {}, users: {}, speaking: {}, ac: null, closed: false, tries: 0, rt: null, pongAt: 0 };
+        connect();
+    }
+    function connect() {
+        var s = S; if (!s || s.closed) return;
+        if (s.rt) { clearTimeout(s.rt); s.rt = null; }
+        try { if (s.ws) { s.ws.onclose = null; s.ws.close(); } } catch (e) {}
+        Object.keys(s.peers).forEach(function (id) { closePeer(s, id); });
+        Object.keys(s).forEach(function (k) { if (k.indexOf('an_') === 0) delete s[k]; });
+        s.users = {}; s.speaking = {}; s.id = null;
         var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
         var ws = new WebSocket(proto + location.host + '/ws');
-        S = { ws: ws, stream: stream, id: null, name: name, ice: [], peers: {}, users: {}, speaking: {}, ac: null, closed: false };
-        ws.onopen = function () { ws.send(JSON.stringify({ t: 'join', name: name })); };
-        ws.onmessage = function (e) { var d; try { d = JSON.parse(e.data); } catch (x) { return; } onMsg(d); };
-        ws.onclose = function () { if (S && !S.closed) leave('انقطع الاتصال'); };
+        s.ws = ws;
+        ws.onopen = function () { ws.send(JSON.stringify({ t: 'join', name: s.name })); };
+        ws.onmessage = function (e) { if (S !== s || s.ws !== ws) return; var d; try { d = JSON.parse(e.data); } catch (x) { return; } onMsg(d); };
+        ws.onclose = function () { if (S === s && s.ws === ws) scheduleReconnect(); };
         ws.onerror = function () {};
     }
+    function scheduleReconnect() {
+        var s = S; if (!s || s.closed || s.rt) return;
+        if (s.tries >= 15) { leave('انقطع الاتصال'); return; }
+        s.tries++;
+        toast('انقطع الاتصال… جاري إعادة الاتصال');
+        s.rt = setTimeout(function () { s.rt = null; connect(); }, Math.min(800 * s.tries, 5000));
+    }
+    // إعادة تشغيل المايك لو الأيفون قتله بالخلفية، وإرجاع الصوت والاتصال
+    async function ensureMic() {
+        var s = S; if (!s) return;
+        var t = s.stream.getAudioTracks()[0];
+        if (t && t.readyState === 'live') return;
+        var wasOn = t ? t.enabled : true;
+        var ns = await getMic();
+        if (!ns) { toast('المايك توقف — اضغط على الشاشة مرة ثانية لتشغيله'); return; }
+        if (S !== s) { ns.getTracks().forEach(function (x) { x.stop(); }); return; }
+        var nt = ns.getAudioTracks()[0]; nt.enabled = wasOn;
+        try { s.stream.getTracks().forEach(function (x) { x.stop(); }); } catch (e) {}
+        s.stream = ns;
+        Object.keys(s.peers).forEach(function (id) {
+            s.peers[id].pc.getSenders().forEach(function (sd) { if (!sd.track || sd.track.kind === 'audio') sd.replaceTrack(nt).catch(function () {}); });
+        });
+        if (s.id) watch(s.id, ns);
+        applyMicUi();
+    }
+    function resumeAll() {
+        var s = S; if (!s) return;
+        ensureMic();
+        try { if (s.ac && s.ac.state === 'suspended') s.ac.resume(); } catch (e) {}
+        Object.keys(s.peers).forEach(function (id) { var a = s.peers[id].audio; if (a && a.paused) { var p = a.play(); if (p && p.catch) p.catch(function () {}); } });
+        try { if (KEEP && KEEP.paused && micOn()) KEEP.play().catch(function () {}); } catch (e) {}
+        if (!s.ws || s.ws.readyState > 1) { s.tries = 0; connect(); return; }
+        if (s.ws.readyState === 1) {   // الاتصال ممكن يكون ميت بدون ما نحس: نفحصه
+            var t0 = Date.now(); s.pongAt = 0;
+            try { s.ws.send(JSON.stringify({ t: 'ping' })); } catch (e) {}
+            setTimeout(function () { if (S === s && !s.pongAt && Date.now() - t0 >= 2400) { try { s.ws.close(); } catch (e) {} s.tries = 0; connect(); } }, 2500);
+        }
+    }
+    document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'visible') resumeAll(); });
+    window.addEventListener('pageshow', function () { resumeAll(); });
+    window.addEventListener('focus', function () { resumeAll(); });
+    $('room').addEventListener('click', function () { resumeAll(); });
 
     function leave(msg) {
         if (!S) return;
         var s = S; s.closed = true; S = null;
+        if (s.rt) clearTimeout(s.rt);
         Object.keys(s.peers).forEach(function (id) { closePeer(s, id); });
         try { s.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
-        try { s.ws.close(); } catch (e) {}
+        try { s.ws.onclose = null; s.ws.close(); } catch (e) {}
         try { if (s.ac) s.ac.close(); } catch (e) {}
         clearInterval(s.timer);
         clearNotif();
@@ -314,6 +417,7 @@ const PAGE = `<!DOCTYPE html>
         stopKeepAlive();
         try { if (navigator.mediaSession) { ['togglemicrophone', 'hangup', 'pause', 'play', 'stop'].forEach(function (a) { try { navigator.mediaSession.setActionHandler(a, null); } catch (e) {} }); navigator.mediaSession.metadata = null; } } catch (e) {}
         $('room').classList.remove('open');
+        paintStatus();
         document.body.style.overflow = '';
         $('enter-btn').disabled = false;
         $('mic-btn').classList.remove('off'); $('mic-btn').textContent = '🎙️ المايك';
@@ -324,6 +428,7 @@ const PAGE = `<!DOCTYPE html>
 
     function onMsg(d) {
         if (!S) return;
+        if (d.t === 'pong') { S.pongAt = Date.now(); return; }
         if (d.t === 'full') { leave('التردد ممتلئ حالياً، حاول بعد شوي'); return; }
         if (d.t === 'welcome') {
             S.id = d.id; S.ice = d.ice || [];
@@ -334,7 +439,7 @@ const PAGE = `<!DOCTYPE html>
             watch(S.id, S.stream);
             // القادم الجديد هو اللي يبدأ الاتصال مع الموجودين
             (d.peers || []).forEach(function (p) { var P = makePeer(p.id); startOffer(P); });
-            S.timer = setInterval(paintSpeaking, 150);
+            if (!S.timer) S.timer = setInterval(paintSpeaking, 150);
             paint();
             applyMicUi();
         } else if (d.t === 'joined') {
@@ -554,6 +659,8 @@ wss.on("connection", (ws) => {
             users.set(myId, { ws, name });
             sendTo(ws, { t: "welcome", id: myId, ice: iceServers(), peers });
             broadcast({ t: "joined", id: myId, name }, myId);
+        } else if (d.t === "ping") {
+            sendTo(ws, { t: "pong" });
         } else if (d.t === "signal" && myId) {
             const target = users.get(String(d.to));
             if (target) sendTo(target.ws, { t: "signal", from: myId, data: d.data });
